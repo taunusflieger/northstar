@@ -19,28 +19,24 @@ use super::{
     process::{ExitStatus, Process},
 };
 use crate::{
-    api::{InstallationResult, Message, MessageId, Notification},
+    api::Notification,
     manifest::{Manifest, Mount, Name, Version},
     runtime::{
-        error::{Error, InstallFailure},
+        error::{Error, InstallationError},
         npk,
-        npk::extract_manifest,
+        npk::read_manifest,
         Event, EventTx,
     },
 };
-use async_std::{
-    fs,
-    path::{Path, PathBuf},
-    stream::StreamExt,
-    sync,
-};
-use ed25519_dalek::PublicKey;
-use log::{info, warn};
+use ed25519_dalek::*;
+use log::{debug, error, info, warn};
 use std::{
     collections::{HashMap, HashSet},
-    fmt, iter, result, time,
+    fmt, iter,
+    path::Path,
+    result,
 };
-use time::Duration;
+use tokio::{fs, stream::StreamExt, time};
 
 #[derive(Debug)]
 pub struct State {
@@ -75,7 +71,7 @@ impl ProcessContext {
         self.process.as_mut()
     }
 
-    pub fn uptime(&self) -> Duration {
+    pub fn uptime(&self) -> time::Duration {
         self.start_timestamp.elapsed()
     }
 }
@@ -123,8 +119,9 @@ impl State {
     /// Create a new empty State instance
     pub async fn new(config: &Config, tx: EventTx) -> Result<State, Error> {
         // Load keys for manifest verification
-        let key_dir: PathBuf = config.directories.key_dir.clone().into();
-        let signing_keys = keys::load(&key_dir).await.map_err(Error::KeyError)?;
+        let signing_keys = keys::load(&config.directories.key_dir)
+            .await
+            .map_err(Error::KeyError)?;
 
         Ok(State {
             events_tx: tx,
@@ -133,11 +130,6 @@ impl State {
             resources: HashMap::new(),
             config: config.clone(),
         })
-    }
-
-    /// Return an owned copy of the main loop tx handle
-    pub fn _event_tx(&self) -> EventTx {
-        self.events_tx.clone()
     }
 
     /// Return an iterator over all known applications
@@ -156,7 +148,7 @@ impl State {
     }
 
     /// Add a container instance the list of known containers
-    pub fn add(&mut self, container: Container) -> Result<(), InstallFailure> {
+    pub fn add(&mut self, container: Container) -> Result<(), InstallationError> {
         let name = container.manifest.name.clone();
         let version = container.manifest.version.clone();
         if container.is_resource_container() {
@@ -165,13 +157,13 @@ impl State {
                 .get(&(name.clone(), version.clone()))
                 .is_some()
             {
-                return Err(InstallFailure::ApplicationAlreadyInstalled(name));
+                return Err(InstallationError::ApplicationAlreadyInstalled(name));
             }
             let app = Application::new(container);
             self.resources.insert((name, version), app);
         } else {
             if self.applications.get(&name).is_some() {
-                return Err(InstallFailure::ApplicationAlreadyInstalled(name));
+                return Err(InstallationError::ApplicationAlreadyInstalled(name));
             }
             let app = Application::new(container);
             self.applications.insert(name, app);
@@ -220,29 +212,29 @@ impl State {
 
         // Android and Linux
         #[cfg(any(target_os = "android", target_os = "linux"))]
-        let process = super::process::minijail::MinijailProcess::start(
+        let process = super::process::minijail::Process::start(
             &app.container,
             self.events_tx.clone(),
-            self.config.directories.run_dir.as_path().into(),
-            self.config.directories.data_dir.as_path().into(),
+            self.config.directories.run_dir.as_path(),
+            self.config.directories.data_dir.as_path(),
             self.config.container_uid,
             self.config.container_gid,
         )
         .await
-        .map_err(Error::ProcessError)?;
+        .map_err(Error::Process)?;
 
         // Not Android or Linux
         #[cfg(not(any(target_os = "android", target_os = "linux")))]
-        let process = super::process::os::OsProcess::start(&app.container, self.events_tx.clone())
+        let process = super::process::raw::Process::start(&app.container, self.events_tx.clone())
             .await
-            .map_err(Error::ProcessError)?;
+            .map_err(Error::Process)?;
 
         let process = Box::new(process) as Box<dyn Process>;
 
         // CGroups
         #[cfg(any(target_os = "android", target_os = "linux"))]
         let cgroups = if let Some(ref c) = app.manifest().cgroups {
-            log::debug!("Creating cgroup configuration for {}", app);
+            debug!("Creating cgroup configuration for {}", app);
             let cgroups = crate::runtime::linux::cgroups::CGroups::new(
                 &self.config.cgroups,
                 app.name(),
@@ -250,13 +242,10 @@ impl State {
                 self.events_tx.clone(),
             )
             .await
-            .map_err(Error::CGroupProblem)?;
+            .map_err(Error::CGroup)?;
 
-            log::debug!("Assigning {} to cgroup {}", process.pid(), app);
-            cgroups
-                .assign(process.pid())
-                .await
-                .map_err(Error::CGroupProblem)?;
+            debug!("Assigning {} to cgroup {}", process.pid(), app);
+            cgroups.assign(process.pid()).await.map_err(Error::CGroup)?;
             Some(cgroups)
         } else {
             None
@@ -269,12 +258,16 @@ impl State {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             cgroups,
         });
-        self.events_tx
-            .send(Event::Notification(Notification::ApplicationStarted(
+
+        Self::notification(
+            &self.events_tx,
+            Notification::ApplicationStarted(
                 name.to_owned(),
                 app.container.manifest.version.clone(),
-            )))
-            .await;
+            ),
+        )
+        .await;
+
         info!("Started {}", app);
 
         Ok(())
@@ -282,7 +275,7 @@ impl State {
 
     /// Stop a application. Timeout specifies the time until the process is
     /// SIGKILLed if it doesn't exit when receiving a SIGTERM
-    pub async fn stop(&mut self, name: &str, timeout: Duration) -> result::Result<(), Error> {
+    pub async fn stop(&mut self, name: &str, timeout: time::Duration) -> result::Result<(), Error> {
         if let Some(app) = self.applications.get_mut(name) {
             if let Some(mut context) = app.process.take() {
                 info!("Stopping {}", app);
@@ -290,22 +283,26 @@ impl State {
                     .process
                     .stop(timeout)
                     .await
-                    .map_err(Error::ProcessError)?;
+                    .map_err(Error::Process)?;
 
                 #[cfg(any(target_os = "android", target_os = "linux"))]
                 {
                     if let Some(cgroups) = context.cgroups {
-                        log::debug!("Destroying cgroup configuration of {}", app);
-                        cgroups.destroy().await.map_err(Error::CGroupProblem)?;
+                        debug!("Destroying cgroup configuration of {}", app);
+                        cgroups.destroy().await.map_err(Error::CGroup)?;
                     }
                 }
 
-                self.events_tx
-                    .send(Event::Notification(Notification::ApplicationStopped(
+                // Send notification to main loop
+                Self::notification(
+                    &self.events_tx,
+                    Notification::ApplicationStopped(
                         name.to_owned(),
                         app.container.manifest.version.clone(),
-                    )))
-                    .await;
+                    ),
+                )
+                .await;
+
                 info!("Stopped {} {:?}", app, status);
                 Ok(())
             } else {
@@ -317,139 +314,109 @@ impl State {
         }
     }
 
-    pub async fn shutdown(&self) -> result::Result<(), Error> {
-        if self
+    /// Send a shutdown request to the main loop
+    pub async fn initiate_shutdown(&mut self) {
+        self.events_tx
+            .send(Event::Shutdown)
+            .await
+            .expect("Internal channel error on main");
+    }
+
+    /// Shutdown the runtime: stop running applications and umount npks
+    pub async fn shutdown(&mut self) -> result::Result<(), Error> {
+        let running_containers: Vec<String> = self
             .applications
             .values()
-            .all(|app| app.process_context().is_none())
-        {
-            // remove mounts before shutdown
-            for (name, container) in self.applications.values().map(|a| (a.name(), &a.container)) {
-                info!("Removing {}", name);
-                crate::runtime::npk::uninstall(container)
-                    .await
-                    .map_err(Error::UninstallationError)?;
-            }
-
-            self.events_tx
-                .send(Event::Notification(Notification::ShutdownOccurred))
-                .await;
-            self.events_tx.send(Event::Shutdown).await;
-            Ok(())
-        } else {
-            let apps = self
-                .applications
-                .values()
-                .filter_map(|app| app.process_context().map(|_| app.name().to_string()))
-                .collect();
-            Err(Error::ApplicationRunning(apps))
+            .filter_map(|a| a.process.as_ref().and(Some(a.name().clone())))
+            .collect();
+        for name in running_containers {
+            self.stop(&name, time::Duration::from_secs(5)).await?;
         }
-    }
 
-    /// Install a npk from give path
-    pub async fn install(
-        &mut self,
-        npk: &Path,
-        msg_id: MessageId,
-        container_dir: Option<std::path::PathBuf>,
-        tx: sync::Sender<Message>,
-    ) {
-        match extract_manifest(npk.into(), &self.signing_keys) {
-            Err(e) => {
-                warn!("Could not get package name from manifest");
-                let _ = self
-                    .events_tx
-                    .send(Event::InstallationFinished(
-                        e.into(),
-                        std::path::PathBuf::from(npk),
-                        msg_id,
-                        tx,
-                        None,
-                    ))
-                    .await;
-            }
-            Ok(manifest) => {
-                let pkg_file_name = format!("{}-{}.npk", manifest.name, manifest.version,);
-                log::debug!(
-                    "Try to install {}, checking the installed apps",
-                    manifest.name
-                );
-                let registry_path = container_dir.map(|p| p.join(&pkg_file_name));
-                log::debug!("Try to install..., registry_path: {:?}", registry_path);
-                if manifest.is_resource_image() {
-                    if self
-                        .resources
-                        .contains_key(&(manifest.name, manifest.version))
-                    {
-                        warn!("Resource container with same version already installed");
-                        let _ = self
-                            .events_tx
-                            .send(Event::InstallationFinished(
-                                InstallationResult::DuplicateResource,
-                                std::path::PathBuf::from(npk),
-                                msg_id,
-                                tx,
-                                registry_path,
-                            ))
-                            .await;
-                        return;
-                    }
-                } else {
-                    // regular application
-                    if self.applications.contains_key(&manifest.name) {
-                        warn!("Cannot install already installed application");
-                        let _ = self
-                            .events_tx
-                            .send(Event::InstallationFinished(
-                                InstallationResult::ApplicationAlreadyInstalled,
-                                std::path::PathBuf::from(npk),
-                                msg_id,
-                                tx,
-                                registry_path,
-                            ))
-                            .await;
-                        return;
-                    }
-                }
-                match npk::install(self, npk).await {
-                    Ok((name, version)) => {
-                        info!("Installation succeeded!");
-                        let _ = self
-                            .events_tx
-                            .send(Event::InstallationFinished(
-                                InstallationResult::Success,
-                                std::path::PathBuf::from(npk),
-                                msg_id,
-                                tx,
-                                registry_path,
-                            ))
-                            .await;
-                        // generate notification for installation event
-                        self.events_tx
-                            .send(Event::Notification(Notification::InstallationFinished(
-                                name, version,
-                            )))
-                            .await;
-                    }
-                    Err(e) => {
-                        warn!("Installation failed: {}", e);
-                        let _ = self
-                            .events_tx
-                            .send(Event::InstallationFinished(
-                                e.into(),
-                                std::path::PathBuf::from(npk),
-                                msg_id,
-                                tx,
-                                None,
-                            ))
-                            .await;
-                    }
-                }
+        for (name, container) in self.applications.values().map(|a| (a.name(), &a.container)) {
+            if let Err(e) = crate::runtime::npk::umount(container)
+                .await
+                .map_err(Error::UninstallationError)
+            {
+                error!("Failed to umount {}: {:?}", name, e);
             }
         }
+
+        for (name, container) in self.resources().map(|a| (a.name(), &a.container)) {
+            info!("Umounting {}", name);
+            crate::runtime::npk::umount(container)
+                .await
+                .map_err(Error::UninstallationError)?;
+        }
+
+        Ok(())
     }
 
-    fn is_app_installed(&self, name: &str, version: &Version) -> bool {
+    /// Install a npk
+    pub async fn install(&mut self, npk: &Path) -> Result<(), InstallationError> {
+        let manifest = read_manifest(npk, &self.signing_keys)?;
+
+        let package = format!("{}-{}.npk", manifest.name, manifest.version);
+        debug!(
+            "Trying to install {}. Checking the installed applications",
+            manifest.name
+        );
+
+        let registry = self
+            .config
+            .directories
+            .container_dirs
+            .first()
+            .unwrap()
+            .join(&package);
+
+        debug!("Trying to install to registry {}", registry.display());
+
+        if manifest.is_resource() {
+            if self
+                .resources
+                .contains_key(&(manifest.name.clone(), manifest.version.clone()))
+            {
+                warn!("Resource container with same version already installed");
+                return Err(InstallationError::DuplicateResource);
+            }
+        } else if self.applications.contains_key(&manifest.name) {
+            return Err(InstallationError::ApplicationAlreadyInstalled(
+                manifest.name.clone(),
+            ));
+        }
+
+        // Copy tmpfile into registry
+        fs::copy(&npk, &registry)
+            .await
+            .map_err(|error| InstallationError::Io {
+                context: "Failed to copy npk to registry".to_string(),
+                error,
+            })?;
+
+        // Install and mount npk
+        npk::mount(self, &registry).await?;
+
+        // Remove tmpfile
+        // TODO: move this to console?
+        fs::remove_file(npk)
+            .await
+            .map_err(|error| InstallationError::Io {
+                context: format!("Failed to remove {}", npk.display()),
+                error,
+            })?;
+
+        // Send notification about newly install npk
+        Self::notification(
+            &self.events_tx,
+            Notification::Install(manifest.name.clone(), manifest.version.clone()),
+        )
+        .await;
+
+        Ok(())
+    }
+
+    fn is_installed(&self, name: &str, version: &Version) -> bool {
         match self.applications.get(name) {
             None => self
                 .resources
@@ -463,14 +430,15 @@ impl State {
     /// app has to be stopped before it can be uninstalled
     // TODO uninstall resource
     pub async fn uninstall(&mut self, name: &str, version: &Version) -> result::Result<(), Error> {
-        if !self.is_app_installed(name, version) {
+        if !self.is_installed(name, version) {
             return Err(Error::ApplicationNotFound);
         }
+
         let installed_app = self.applications.get(name);
         let to_uninstall = match installed_app {
             Some(app) => {
                 if app.is_running() {
-                    warn!("Cannot uninstall running container {}", app);
+                    warn!("Cannot uninstall started container {}", app);
                     return Err(Error::ApplicationRunning(vec![app.manifest().name.clone()]));
                 }
                 Some(app)
@@ -479,54 +447,50 @@ impl State {
         };
         if let Some(app) = to_uninstall {
             if app.is_running() {
-                warn!("Cannot uninstall running container {}", app);
+                warn!("Cannot uninstall started container {}", app);
                 return Err(Error::ApplicationRunning(vec![app.manifest().name.clone()]));
             }
-            info!("Removing {}", app);
-            npk::uninstall(app.container())
+            info!("Uninstalling {}", app);
+            npk::umount(app.container())
                 .await
                 .map_err(Error::UninstallationError)?;
             self.applications.remove(name);
             self.resources.remove(&(name.to_string(), version.clone()));
 
-            // remove npk from registry
+            // Remove npk from registry
             for d in &self.config.directories.container_dirs {
                 let mut dir = fs::read_dir(&d).await.map_err(|e| {
-                    Error::UninstallationError(InstallFailure::FileIoProblem {
-                        context: "Could not read directory".to_string(),
+                    Error::UninstallationError(InstallationError::Io {
+                        context: format!("Failed to read {}", d.display()),
                         error: e,
                     })
                 })?;
                 while let Some(res) = dir.next().await {
                     let entry = res.map_err(|e| {
-                        Error::UninstallationError(InstallFailure::FileIoProblem {
-                            context: "Could not read directory".to_string(),
+                        Error::UninstallationError(InstallationError::Io {
+                            context: "Could not read directory".to_string(), // TODO: Which directory?
                             error: e,
                         })
                     })?;
-                    let manifest =
-                        extract_manifest(entry.path().as_path().into(), &self.signing_keys)
-                            .map_err(Error::UninstallationError)?;
+                    let manifest = read_manifest(entry.path().as_path(), &self.signing_keys)
+                        .map_err(Error::UninstallationError)?;
 
                     if manifest.name == name && manifest.version == *version {
                         fs::remove_file(&entry.path()).await.map_err(|e| {
-                            Error::UninstallationError(InstallFailure::FileIoProblem {
-                                context: format!(
-                                    "Could not remove npk {}",
-                                    entry.path().to_string_lossy()
-                                ),
+                            Error::UninstallationError(InstallationError::Io {
+                                context: format!("Failed to remove {}", entry.path().display()),
                                 error: e,
                             })
                         })?;
                     }
                 }
             }
-            self.events_tx
-                .send(Event::Notification(Notification::Uninstalled(
-                    name.to_owned(),
-                    version.clone(),
-                )))
-                .await;
+
+            Self::notification(
+                &self.events_tx,
+                Notification::Uninstalled(name.to_owned(), version.clone()),
+            )
+            .await;
         }
 
         Ok(())
@@ -548,21 +512,24 @@ impl State {
                 {
                     let mut context = context;
                     if let Some(cgroups) = context.cgroups.take() {
-                        log::debug!("Destroying cgroup configuration of {}", app);
-                        cgroups.destroy().await.map_err(Error::CGroupProblem)?;
+                        debug!("Destroying cgroup configuration of {}", app);
+                        cgroups.destroy().await.map_err(Error::CGroup)?;
                     }
                 }
                 let exit_info = match exit_status {
                     ExitStatus::Exit(c) => format!("Exited with code {}", c),
                     ExitStatus::Signaled(s) => format!("Terminated by signal {}", s.as_str()),
                 };
-                self.events_tx
-                    .send(Event::Notification(Notification::ApplicationExited {
+
+                Self::notification(
+                    &self.events_tx,
+                    Notification::ApplicationExited {
                         id: name.to_owned(),
                         version: app.container.manifest.version.clone(),
                         exit_info,
-                    }))
-                    .await;
+                    },
+                )
+                .await;
             }
         }
         Ok(())
@@ -579,16 +546,24 @@ impl State {
                 info!("Stopping {}", app);
                 context
                     .process_mut()
-                    .stop(Duration::from_secs(1))
+                    .stop(time::Duration::from_secs(1))
                     .await
-                    .map_err(Error::ProcessError)?;
+                    .map_err(Error::Process)?;
+
                 self.events_tx
                     .send(Event::Notification(Notification::OutOfMemory(
                         name.to_owned(),
                     )))
-                    .await;
+                    .await
+                    .expect("Internal channel error on main");
             }
         }
         Ok(())
+    }
+
+    async fn notification(tx: &EventTx, n: Notification) {
+        tx.send(Event::Notification(n))
+            .await
+            .expect("Internal channel error on main");
     }
 }

@@ -22,54 +22,41 @@ pub(self) mod npk;
 pub(self) mod process;
 pub(super) mod state;
 
-use crate::{
-    api,
-    api::{InstallationResult, MessageId, Notification},
-    manifest::Name,
-    runtime::error::Error,
-};
-use async_std::{fs, path::PathBuf, sync};
+use crate::{api, api::Notification, manifest::Name, runtime::error::Error};
 use config::Config;
+use console::Request;
 use log::*;
+use nix::{sys::stat, unistd};
 use process::ExitStatus;
 use state::State;
-use std::collections::HashMap;
+use std::{
+    future::Future,
+    path::Path,
+    pin::Pin,
+    task::{Context, Poll},
+};
+use sync::mpsc;
+use tokio::{
+    fs,
+    sync::{self, oneshot},
+    task,
+};
 
-pub type EventTx = sync::Sender<Event>;
-pub type NotificationTx = sync::Sender<Notification>;
-
-pub type NotificationRx = sync::Receiver<Notification>;
+pub type EventTx = mpsc::Sender<Event>;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Event {
     /// Incomming command
-    Console(api::Message, sync::Sender<api::Message>),
-    /// Installation Event
-    Install(api::MessageId, PathBuf, sync::Sender<api::Message>),
-    /// Installation finished event
-    InstallationFinished(
-        InstallationResult,
-        std::path::PathBuf, // path to the temp npk file that was received
-        MessageId,          // UID of the message that triggered the installation
-        sync::Sender<api::Message>,
-        Option<std::path::PathBuf>, // path to registry
-    ),
+    Console(Request, oneshot::Sender<api::Message>),
     /// A instance exited with return code
     Exit(Name, ExitStatus),
     /// Out of memory event occured
     Oom(Name),
-    /// Fatal unhandleable error
-    Error(Error),
     /// North shall shut down
     Shutdown,
     /// Stdout and stderr of child processes
     ChildOutput { name: Name, fd: i32, line: String },
-    /// Add or remove a subscriber to notifications
-    NotificationSubscription {
-        id: String,
-        subscriber: Option<NotificationTx>,
-    },
     /// Notification events
     Notification(Notification),
 }
@@ -82,49 +69,87 @@ pub enum TerminationReason {
     OutOfMemory,
 }
 
-pub async fn run(config: &Config) -> Result<(), Error> {
-    // On Linux systems north enters a mount namespace for automatic
-    // umounting of npks. Next the mount propagation of the the parent
-    // mount of the run dir is set to private. See linux::init for details.
-    #[cfg(any(target_os = "android", target_os = "linux"))]
-    linux::init(&config).await?;
+/// Result of a Runtime action
+pub type RuntimeResult = Result<(), Error>;
 
-    // Northstar runs in a event loop. Moduls get a Sender<Event> to the main
-    // loop.
-    let (event_tx, event_rx) = sync::channel::<Event>(100);
+/// Handle to the Northstar runtime
+pub struct Runtime {
+    /// Channel receive a stop signal for the runtime
+    /// Drop the tx part to gracefully shutdown the mail loop.
+    stop: Option<oneshot::Sender<()>>,
+    // Channel to signal the runtime exit status to the caller of `start`
+    // When the runtime is shut down the result of shutdown is sent to this
+    // channel. If a error happens during normal operation the error is also
+    // sent to this channel.
+    stopped: oneshot::Receiver<RuntimeResult>,
+}
 
-    let mut state = State::new(config, event_tx.clone()).await?;
+impl Runtime {
+    pub async fn start(config: Config) -> Result<Runtime, Error> {
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let (stopped_tx, stopped_rx) = oneshot::channel();
 
-    // Ensure the configured run_dir exists
-    // TODO: permission check of SETTINGS.directories.run_dir
-    fs::create_dir_all(&config.directories.run_dir)
-        .await
-        .map_err(|e| Error::GeneralIoProblem {
-            context: format!("Failed to create {}", config.directories.run_dir.display()),
-            error: e,
-        })?;
+        // Initialize minijails static functionality
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        linux::minijail::init().await.map_err(Error::Minijail)?;
 
-    // Ensure the configured data_dir exists
-    fs::create_dir_all(&config.directories.data_dir)
-        .await
-        .map_err(|e| Error::GeneralIoProblem {
-            context: format!("Failed to create {}", config.directories.data_dir.display()),
-            error: e,
-        })?;
+        // Ensure the configured run_dir exists
+        mkdir_p_rw(&config.directories.data_dir).await?;
+        mkdir_p_rw(&config.directories.run_dir).await?;
 
-    // Iterate all files in SETTINGS.directories.container_dirs and try
-    // to load/install the npks.
-    for d in &config.directories.container_dirs {
-        let d: PathBuf = d.into();
-        npk::install_all(&mut state, &d.as_path())
-            .await
-            .map_err(Error::InstallationError)?;
+        // Start a task that drives the main loop and wait for shutdown results
+        task::spawn(async {
+            stopped_tx.send(runtime_task(config, stop_rx).await).ok(); // Ignore error if calle dropped the handle
+        });
+
+        Ok(Runtime {
+            stop: Some(stop_tx),
+            stopped: stopped_rx,
+        })
     }
 
-    info!(
-        "Installed and loaded {} containers",
-        state.applications.len()
-    );
+    /// Stop the runtime
+    pub fn stop(mut self) {
+        // Drop the sending part of the stop handle
+        self.stop.take();
+    }
+
+    /// Stop the runtime and wait for the termination
+    pub fn stop_wait(mut self) -> impl Future<Output = RuntimeResult> {
+        self.stop.take();
+        self
+    }
+}
+
+impl Future for Runtime {
+    type Output = RuntimeResult;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.stopped).poll(cx) {
+            Poll::Ready(r) => match r {
+                Ok(r) => Poll::Ready(r),
+                // Channel error -> tx side dropped
+                Err(_) => Poll::Ready(Ok(())),
+            },
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+pub async fn runtime_task(config: Config, stop: oneshot::Receiver<()>) -> Result<(), Error> {
+    // Northstar runs in a event loop. Moduls get a Sender<Event> to the main loop.
+    let (event_tx, mut event_rx) = mpsc::channel::<Event>(100);
+    let mut state = State::new(&config, event_tx.clone()).await?;
+
+    // Iterate all files in SETTINGS.directories.container_dirs and try
+    // to mount the content.
+    for registry in &config.directories.container_dirs {
+        npk::mount_all(&mut state, &registry)
+            .await
+            .map_err(Error::Installation)?;
+    }
+
+    info!("Mounted {} containers", state.applications.len());
 
     // Autostart flagged containers. Each container with the `autostart` option
     // set to true in the manifest is started.
@@ -136,87 +161,101 @@ pub async fn run(config: &Config) -> Result<(), Error> {
         .collect::<Vec<Name>>();
     for app in &autostart_apps {
         info!("Autostarting {}", app);
-        if let Err(e) = state.start(&app).await {
-            warn!("Failed to start {}: {}", app, e);
-        }
+        state.start(&app).await.ok();
     }
 
     // Initialize console
     let console = console::Console::new(&config.console_address, &event_tx);
-    // and start servicing clients
-    console.start_listening().await?;
+    // Start to listen for incoming connections
+    console.listen().await?;
 
-    let mut subscriber_map = HashMap::new();
+    // Wait for a external shutdown request
+    let shutdown_tx = event_tx.clone();
+    task::spawn(async move {
+        stop.await.ok();
+        shutdown_tx.send(Event::Shutdown).await.ok();
+    });
+
     // Enter main loop
-    while let Ok(event) = event_rx.recv().await {
-        match event {
+    loop {
+        let result = match event_rx.recv().await.unwrap() {
             Event::ChildOutput { name, fd, line } => {
-                on_child_output(&mut state, &name, fd, &line).await
+                on_child_output(&mut state, &name, fd, &line).await;
+                Ok(())
             }
             // Debug console commands are handled via the main loop in order to get access
             // to the global state. Therefore the console server receives a tx handle to the
             // main loop and issues `Event::Console`. Processing of the command takes place
             // in the console module but with access to `state`.
-            Event::Console(msg, txr) => console.process(&mut state, &msg, txr).await,
-            // Installation event that triggers the installation of a received file
-            Event::Install(msg_id, path, txr) => {
-                state
-                    .install(
-                        &path,
-                        msg_id,
-                        config.directories.container_dirs.first().cloned(),
-                        txr,
-                    )
-                    .await
-            }
-            // Once the installation has finished, the file can be added to the registry
-            Event::InstallationFinished(success, npk, msg_id, txr, container_dir) => {
-                console
-                    .installation_finished(success, msg_id, txr, container_dir, &npk)
-                    .await;
+            Event::Console(msg, txr) => {
+                console.process(&mut state, &msg, txr).await;
+                Ok(())
             }
             // The OOM event is signaled by the cgroup memory monitor if configured in a manifest.
             // If a out of memory condition occours this is signaled with `Event::Oom` which
             // carries the id of the container that is oom.
-            Event::Oom(id) => state.on_oom(&id).await?,
+            Event::Oom(id) => state.on_oom(&id).await,
             // A container process existed. Check `process::wait_exit` for details.
-            Event::Exit(ref name, ref exit_status) => state.on_exit(name, exit_status).await?,
-            // Handle unrecoverable errors by logging it and do a gracefull shutdown.
-            Event::Error(ref error) => {
-                error!("Fatal error: {}", error);
-                break;
-            }
+            Event::Exit(ref name, ref exit_status) => state.on_exit(name, exit_status).await,
             // The runtime os commanded to shut down and exit.
-            Event::Shutdown => break,
-            Event::NotificationSubscription { id, subscriber } => match subscriber {
-                Some(tx) => {
-                    debug!("New notification subscriber: {}", id);
-                    subscriber_map.insert(id, tx);
-                }
-                None => {
-                    debug!("Unsubscribed notification subscriber: {}", id);
-                    subscriber_map.remove(&id);
-                }
-            },
+            Event::Shutdown => break state.shutdown().await,
+            // Forward notifications to console
             Event::Notification(notification) => {
-                for (id, subscriber) in subscriber_map.iter() {
-                    debug!("Give notification to subscriber {}", id);
-                    subscriber.send(notification.clone()).await;
-                }
+                console.notification(notification).await;
+                Ok(())
             }
+        };
+
+        // Break if a error happens in the runtime
+        if result.is_err() {
+            break result;
         }
     }
-
-    info!("Shutting down...");
-
-    Ok(())
 }
 
-/// This is a starting point for doing something meaningful with the childs outputs.
+// TODO: Where to send this?
 async fn on_child_output(state: &mut State, name: &str, fd: i32, line: &str) {
     if let Some(p) = state.application(name) {
         if let Some(p) = p.process_context() {
             debug!("[{}] {}: {}: {}", p.process().pid(), name, fd, line);
         }
+    }
+}
+
+/// Create path if it does not exist. Ensure that it is
+/// read and writeable
+async fn mkdir_p_rw(path: &Path) -> Result<(), Error> {
+    if path.exists() && !is_rw(&path) {
+        Err(Error::FsPermissions(format!(
+            "Directory {} is not read and writeable",
+            path.display()
+        )))
+    } else {
+        debug!("Creating {}", path.display());
+        fs::create_dir_all(&path).await.map_err(|error| Error::Io {
+            context: format!("Failed to create directory {}", path.display()),
+            error,
+        })
+    }
+}
+
+/// Return true if path is read and writeable
+fn is_rw(path: &Path) -> bool {
+    match stat::stat(path.as_os_str()) {
+        Ok(stat) => {
+            let same_uid = stat.st_uid == unistd::getuid().as_raw();
+            let same_gid = stat.st_gid == unistd::getgid().as_raw();
+            let mode = stat::Mode::from_bits_truncate(stat.st_mode);
+
+            let is_readable = (same_uid && mode.contains(stat::Mode::S_IRUSR))
+                || (same_gid && mode.contains(stat::Mode::S_IRGRP))
+                || mode.contains(stat::Mode::S_IROTH);
+            let is_writable = (same_uid && mode.contains(stat::Mode::S_IWUSR))
+                || (same_gid && mode.contains(stat::Mode::S_IWGRP))
+                || mode.contains(stat::Mode::S_IWOTH);
+
+            is_readable && is_writable
+        }
+        Err(_) => false,
     }
 }

@@ -12,10 +12,27 @@
 //   See the License for the specific language governing permissions and
 //   limitations under the License.
 
-use crate::runtime::error::InstallFailure;
-use async_std::path::Path;
+use std::path::Path;
+use thiserror::Error;
 
 pub use nix::mount::MsFlags as MountFlags;
+use tokio::task;
+
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Mount error: {context}")]
+    Mount {
+        context: String,
+        #[source]
+        error: nix::Error,
+    },
+    #[error("Umount error: {context}")]
+    Umount {
+        context: String,
+        #[source]
+        error: nix::Error,
+    },
+}
 
 pub async fn mount(
     source: &Path,
@@ -23,27 +40,32 @@ pub async fn mount(
     fstype: &str,
     flags: MountFlags,
     data: Option<&str>,
-) -> Result<(), InstallFailure> {
-    nix::mount::mount(
-        Some(source.as_os_str()),
-        target.as_os_str(),
-        Some(fstype),
-        flags,
-        data,
-    )
-    .map_err(|e| InstallFailure::MountError {
-        context: format!(
-            "Failed to mount {} on {}",
-            source.display(),
-            target.display()
-        ),
-        error: e,
+) -> Result<(), Error> {
+    task::block_in_place(|| {
+        nix::mount::mount(
+            Some(source.as_os_str()),
+            target.as_os_str(),
+            Some(fstype),
+            flags,
+            data,
+        )
+        .map_err(|error| Error::Mount {
+            context: format!(
+                "Failed to mount {} on {} with flags {:?}",
+                source.display(),
+                target.display(),
+                flags,
+            ),
+            error,
+        })
     })
 }
 
-pub async fn unmount(target: &Path) -> Result<(), InstallFailure> {
-    nix::mount::umount(target.as_os_str()).map_err(|e| InstallFailure::MountError {
-        context: format!("Failed to unmount {}", target.display()),
-        error: e,
+pub async fn unmount(target: &Path) -> Result<(), Error> {
+    task::block_in_place(|| {
+        nix::mount::umount(target.as_os_str()).map_err(|e| Error::Umount {
+            context: format!("Failed to unmount {}", target.display()),
+            error: e,
+        })
     })
 }

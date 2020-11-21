@@ -12,140 +12,177 @@
 //   See the License for the specific language governing permissions and
 //   limitations under the License.
 
-use super::state::State;
 use crate::{
     api,
-    api::{InstallationResult, MessageId, Notification},
-    runtime::{error::Error, Event, EventTx},
-};
-use api::{
-    Container, Message, Payload, Process, Request, Response, ShutdownResult, StartResult,
-    StopResult,
-};
-use async_std::{
-    fs::OpenOptions,
-    io::{self, BufWriter, Read, Write},
-    net::{TcpListener, TcpStream},
-    path::PathBuf,
-    prelude::*,
-    sync::{self, Receiver, Sender},
-    task,
+    runtime::{error::Error, state::State, Event, EventTx},
 };
 use byteorder::{BigEndian, ByteOrder};
-use futures::stream::StreamExt;
-use io::ErrorKind;
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
+use std::{
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
+use sync::mpsc;
 use tempfile::tempdir;
+use tokio::{
+    fs::OpenOptions,
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    net::{TcpListener, TcpStream},
+    select,
+    stream::StreamExt,
+    sync::{self, broadcast, oneshot},
+    task,
+};
 
+// Events from message received by clients in deserialized form
+enum ConnectionEvent {
+    Request(api::Message),
+    Install(api::Message, PathBuf),
+}
+
+type NotificationRx = broadcast::Receiver<api::Notification>;
+
+// Request from the main loop to the console
+#[derive(Debug)]
+pub enum Request {
+    Message(api::Message),
+    Install(api::Message, PathBuf),
+}
+
+/// A console is responsible for monitoring and serving incoming client connections
+/// It feeds relevant events back to the runtime and forwards responses and notifications
+/// to connected clients
 pub struct Console {
     event_tx: EventTx,
     address: String,
+    notification_tx: broadcast::Sender<api::Notification>,
 }
 
 impl Console {
+    /// Construct a new console instance
     pub fn new(address: &str, tx: &EventTx) -> Self {
+        let (notification_tx, _notification_rx) = sync::broadcast::channel(100);
         Self {
             event_tx: tx.clone(),
             address: address.to_owned(),
+            notification_tx,
         }
     }
 
-    /// process a remote API request
-    /// if the request was valid, it is executed and the result is
-    /// sent back to the sender
+    /// Process console events
     pub async fn process(
         &self,
         state: &mut State,
-        message: &Message,
-        response_tx: sync::Sender<Message>,
+        request: &Request,
+        response_tx: oneshot::Sender<api::Message>,
     ) {
-        let payload = &message.payload;
-        if let Payload::Request(ref request) = payload {
-            let response = match request {
-                Request::Containers => {
-                    debug!("Request::Containers received");
-                    Response::Containers(list_containers(&state))
-                }
-                Request::Start(name) => match state.start(&name).await {
-                    Ok(_) => Response::Start {
-                        result: StartResult::Success,
-                    },
-                    Err(e) => {
-                        error!("Failed to start {}: {}", name, e);
-                        Response::Start {
-                            result: StartResult::Error(e.to_string()),
+        match request {
+            Request::Message(message) => {
+                let payload = &message.payload;
+                if let api::Payload::Request(ref request) = payload {
+                    let response = match request {
+                        api::Request::Containers => {
+                            debug!("Request::Containers received");
+                            api::Response::Containers(list_containers(&state))
                         }
-                    }
-                },
-                Request::Stop(name) => {
-                    match state.stop(&name, std::time::Duration::from_secs(1)).await {
-                        Ok(_) => Response::Stop {
-                            result: StopResult::Success,
+                        api::Request::Start(name) => match state.start(&name).await {
+                            Ok(_) => api::Response::Start {
+                                result: api::StartResult::Success,
+                            },
+                            Err(e) => {
+                                error!("Failed to start {}: {}", name, e);
+                                api::Response::Start {
+                                    result: api::StartResult::Error(e.to_string()),
+                                }
+                            }
                         },
-                        Err(e) => {
-                            error!("Failed to stop {}: {}", name, e);
-                            Response::Stop {
-                                result: StopResult::Error(e.to_string()),
+                        api::Request::Stop(name) => {
+                            match state.stop(&name, std::time::Duration::from_secs(1)).await {
+                                Ok(_) => api::Response::Stop {
+                                    result: api::StopResult::Success,
+                                },
+                                Err(e) => {
+                                    error!("Failed to stop {}: {}", name, e);
+                                    api::Response::Stop {
+                                        result: api::StopResult::Error(e.to_string()),
+                                    }
+                                }
                             }
                         }
-                    }
-                }
-                Request::Uninstall { name, version } => {
-                    match state.uninstall(name, version).await {
-                        Ok(_) => Response::Uninstall {
-                            result: api::UninstallResult::Success,
-                        },
-                        Err(e) => {
-                            error!("Failed to uninstall {}: {}", name, e);
-                            Response::Uninstall {
-                                result: api::UninstallResult::Error(e.to_string()),
+                        api::Request::Uninstall { name, version } => {
+                            match state.uninstall(name, version).await {
+                                Ok(_) => api::Response::Uninstall {
+                                    result: api::UninstallResult::Success,
+                                },
+                                Err(e) => {
+                                    error!("Failed to uninstall {}: {}", name, e);
+                                    api::Response::Uninstall {
+                                        result: api::UninstallResult::Error(e.to_string()),
+                                    }
+                                }
                             }
                         }
-                    }
-                }
-                Request::Shutdown => match state.shutdown().await {
-                    Ok(_) => Response::Shutdown {
-                        result: ShutdownResult::Success,
-                    },
-                    Err(e) => Response::Shutdown {
-                        result: ShutdownResult::Error(e.to_string()),
-                    },
-                },
-            };
+                        api::Request::Shutdown => {
+                            state.initiate_shutdown().await;
+                            api::Response::Shutdown {
+                                result: api::ShutdownResult::Success,
+                            }
+                        }
+                        api::Request::Install(_) => unreachable!(),
+                    };
 
-            let response_message = Message {
-                id: message.id.clone(),
-                payload: Payload::Response(response),
-            };
-            response_tx.send(response_message).await;
-        } else {
-            warn!("Received message is not a request");
+                    let response_message = api::Message {
+                        id: message.id.clone(),
+                        payload: api::Payload::Response(response),
+                    };
+
+                    // A error on the response_tx means that the connection
+                    // was closed in the meantime. Ignore it.
+                    response_tx.send(response_message).ok();
+                } else {
+                    warn!("Received message is not a request");
+                }
+            }
+            Request::Install(message, path) => {
+                let payload = match state.install(&path).await {
+                    Ok(_) => api::Response::Install {
+                        result: api::InstallationResult::Success,
+                    },
+                    Err(e) => api::Response::Install { result: e.into() },
+                };
+
+                let message = api::Message {
+                    id: message.id.clone(),
+                    payload: api::Payload::Response(payload),
+                };
+                // A error on the response_tx means that the connection
+                // was closed in the meantime. Ignore it.
+                response_tx.send(message).ok();
+            }
         }
     }
 
     /// Open a TCP socket and listen for incoming connections
     /// spawn a task for each connection
-    pub async fn start_listening(&self) -> Result<(), Error> {
+    pub async fn listen(&self) -> Result<(), Error> {
         debug!("Starting console on {}", self.address);
         let event_tx = self.event_tx.clone();
-        let listener =
-            TcpListener::bind(&self.address)
-                .await
-                .map_err(|e| Error::GeneralIoProblem {
-                    context: format!("Failed to open listener on {}", self.address),
-                    error: e,
-                })?;
+        let mut listener = TcpListener::bind(&self.address)
+            .await
+            .map_err(|e| Error::Io {
+                context: format!("Failed to open listener on {}", self.address),
+                error: e,
+            })?;
 
+        let notification_tx = self.notification_tx.clone();
         task::spawn(async move {
-            let mut incoming = listener.incoming();
-
             // Spawn a task for each incoming connection.
-            while let Some(stream) = incoming.next().await {
-                let event_tx_clone = event_tx.clone();
-                // let notification_rx_clone = notification_rx.clone();
+            while let Some(stream) = listener.next().await {
                 if let Ok(stream) = stream {
+                    let event_tx = event_tx.clone();
+                    let notification_rx = notification_tx.subscribe();
                     task::spawn(async move {
-                        if let Err(e) = connection_loop(stream, event_tx_clone).await {
+                        if let Err(e) = Self::connection(stream, event_tx, notification_rx).await {
                             warn!("Error servicing connection: {}", e);
                         }
                     });
@@ -155,39 +192,146 @@ impl Console {
         Ok(())
     }
 
-    pub async fn installation_finished(
-        &self,
-        install_result: InstallationResult,
-        msg_id: MessageId,
-        response_message_tx: sync::Sender<Message>,
-        registry_path: Option<std::path::PathBuf>,
-        npk: &std::path::Path,
-    ) {
-        debug!("Installation finished, registry_path: {:?}", registry_path,);
-        let mut install_result = install_result;
-        if let (InstallationResult::Success, Some(new_path)) = (&install_result, registry_path) {
-            // move npk into container dir
-            if let Err(e) = async_std::fs::rename(npk, new_path).await {
-                install_result =
-                    InstallationResult::FileIoProblem(format!("Could not replace npk: {}", e));
+    /// Send a notification to the notification broadcast
+    pub async fn notification(&self, notification: api::Notification) {
+        debug!("sending notification: {:?}", notification);
+        if self.notification_tx.send(notification).is_err() {
+            debug!("No subscribers received the notification");
+        }
+    }
+
+    async fn connection(
+        stream: TcpStream,
+        event_tx: EventTx,
+        mut notification_rx: NotificationRx,
+    ) -> Result<(), Error> {
+        let peer = stream.peer_addr().map_err(|e| Error::Io {
+            context: "Failed to get peer from command connection".to_string(),
+            error: e,
+        })?;
+        debug!("Client {:?} connected", peer);
+
+        let tmpdir = tempdir().map_err(|e| Error::Io {
+            context: "Error creating temp installation dir".to_string(),
+            error: e,
+        })?;
+
+        let dir = tmpdir.path().to_owned();
+
+        let (reader, mut writer) = stream.into_split();
+
+        // RX
+        let mut client_in = {
+            let (tx, rx) = mpsc::channel(10);
+            task::spawn(async move {
+                let mut reader = BufReader::new(reader);
+                loop {
+                    match read(&mut reader, &dir).await {
+                        Ok(event) => {
+                            if tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!("Error receiving from socket: {}", e);
+                            break;
+                        }
+                    }
+                }
+            });
+            rx
+        };
+
+        // TX
+        let client_out = {
+            let (tx, mut rx_messages) = mpsc::channel::<api::Message>(1);
+            task::spawn(async move {
+                async fn send<W: Unpin + AsyncWrite>(
+                    reply: &api::Message,
+                    writer: &mut W,
+                ) -> io::Result<()> {
+                    // Serialize reply
+                    let reply = serde_json::to_string_pretty(&reply)
+                        .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
+
+                    // Send reply
+                    let mut buffer = [0u8; 4];
+                    BigEndian::write_u32(&mut buffer, reply.len() as u32);
+                    writer.write_all(&buffer).await?;
+                    writer.write_all(reply.as_bytes()).await?;
+                    Ok(())
+                }
+
+                loop {
+                    select! {
+                        message = rx_messages.recv() => {
+                            if let Some(message) = message {
+                                if let Err(e) = send(&message, &mut writer).await {
+                                    // TODO: Is the connection closed if this happens?
+                                    warn!("Error sending back to client: {}", e);
+                                    break;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                        notification = notification_rx.recv() => {
+                            let payload = match notification {
+                                Ok(notification) => notification,
+                                Err(broadcast::error::RecvError::Closed) => break,
+                                Err(broadcast::error::RecvError::Lagged(_)) => {
+                                    warn!("Client connection lagged notifications. Closing");
+                                    break;
+                                }
+                            };
+
+                            let message = api::Message {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                payload: api::Payload::Notification(payload),
+                            };
+                            if send(&message, &mut writer).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            tx
+        };
+
+        while let Some(request) = client_in.next().await {
+            let request = match request {
+                ConnectionEvent::Request(request) => Request::Message(request),
+                ConnectionEvent::Install(message, npk) => Request::Install(message, npk),
+            };
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let event = Event::Console(request, reply_tx);
+            event_tx
+                .send(event)
+                .await
+                .expect("Internal channel error on main");
+
+            let reply = reply_rx
+                .await
+                .expect("Internal channel error on client reply");
+
+            if client_out.send(reply).await.is_err() {
+                break;
             }
         }
-        let response_message = Message {
-            id: msg_id,
-            payload: Payload::Response(Response::Install {
-                result: install_result,
-            }),
-        };
-        response_message_tx.send(response_message).await
+
+        debug!("Connection to {} closed", peer);
+
+        Ok(())
     }
 }
 
-fn list_containers(state: &State) -> Vec<Container> {
-    let mut app_containers: Vec<Container> = state
+fn list_containers(state: &State) -> Vec<api::Container> {
+    let mut app_containers: Vec<api::Container> = state
         .applications()
-        .map(|app| Container {
+        .map(|app| api::Container {
             manifest: app.manifest().clone(),
-            process: app.process_context().map(|f| Process {
+            process: app.process_context().map(|f| api::Process {
                 pid: f.process().pid(),
                 uptime: f.uptime().as_nanos() as u64,
                 memory: {
@@ -212,9 +356,9 @@ fn list_containers(state: &State) -> Vec<Container> {
             }),
         })
         .collect();
-    let mut resource_containers: Vec<Container> = state
+    let mut resource_containers: Vec<api::Container> = state
         .resources()
-        .map(|app| Container {
+        .map(|app| api::Container {
             manifest: app.manifest().clone(),
             process: None,
         })
@@ -223,25 +367,16 @@ fn list_containers(state: &State) -> Vec<Container> {
     app_containers
 }
 
-struct MessageWithData {
-    message: Message,
-    path: Option<std::path::PathBuf>,
-}
-
-async fn receive_message_from_socket<R: Read + Unpin>(
+async fn read<R: AsyncRead + Unpin>(
     reader: &mut R,
-    message_tx: &sync::Sender<Option<MessageWithData>>,
-    tmp_installation_dir: &std::path::Path,
-) -> Result<(), Error> {
+    tmpdir: &Path,
+) -> Result<ConnectionEvent, Error> {
     // Read frame length
     let mut buf = [0u8; 4];
-    reader
-        .read_exact(&mut buf)
-        .await
-        .map_err(|e| Error::GeneralIoProblem {
-            context: "Could not read length of network package".to_string(),
-            error: e,
-        })?;
+    reader.read_exact(&mut buf).await.map_err(|e| Error::Io {
+        context: "Failed to read frame length of network package".to_string(),
+        error: e,
+    })?;
     let frame_len = BigEndian::read_u32(&buf) as usize;
 
     // Read payload
@@ -249,235 +384,42 @@ async fn receive_message_from_socket<R: Read + Unpin>(
     reader
         .read_exact(&mut buffer)
         .await
-        .map_err(|e| Error::GeneralIoProblem {
-            context: "Could not read network package".to_string(),
+        .map_err(|e| Error::Io {
+            context: "Failed to read payload".to_string(),
             error: e,
         })?;
 
-    let message: Message = serde_json::from_slice(&buffer)
-        .map_err(|_| Error::ProtocolError("Could not parse protocol message".to_string()))?;
-    let msg_with_data = match &message.payload {
-        Payload::Installation(size) => {
+    // Deserialize message
+    let message: api::Message = serde_json::from_slice(&buffer)
+        .map_err(|_| Error::Protocol("Failed to deserialize message".to_string()))?;
+
+    match &message.payload {
+        api::Payload::Request(api::Request::Install(size)) => {
             debug!("Incoming installation ({} bytes)", size);
-            let tmp_installation_file_path = tmp_installation_dir.join(&format!(
-                "tmp_install_file_{}.npk",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| format!("{}", d.as_millis()))
-                    .unwrap_or_else(|_| "".to_string())
-            ));
+
+            // Open a tmpfile
+            let file = tmpdir.join(uuid::Uuid::new_v4().to_string());
             let tmpfile = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&tmp_installation_file_path)
+                .open(&file)
                 .await
-                .map_err(|e| Error::GeneralIoProblem {
-                    context: format!(
-                        "Failed to create file {}",
-                        tmp_installation_file_path.display()
-                    ),
+                .map_err(|e| Error::Io {
+                    context: format!("Failed to create file in {}", tmpdir.display()),
                     error: e,
                 })?;
-            let buf_writer = BufWriter::new(tmpfile);
-            let received_bytes = io::copy(reader.take(*size as u64), buf_writer)
+
+            // Stream size bytes into tmpfile
+            let mut writer = BufWriter::new(tmpfile);
+            let n = io::copy(&mut reader.take(*size as u64), &mut writer)
                 .await
-                .map_err(|e| Error::GeneralIoProblem {
-                    context: format!("Could not receive {} bytes", size),
+                .map_err(|e| Error::Io {
+                    context: format!("Failed to receive {} bytes", size),
                     error: e,
                 })?;
-            // buf_writer.flush().await?;
-            debug!("Received {} bytes. Starting installation", received_bytes);
-            MessageWithData {
-                message,
-                path: Some(tmp_installation_file_path),
-            }
+            debug!("Received {} bytes. Starting installation", n);
+            Ok(ConnectionEvent::Install(message, file))
         }
-        _ => MessageWithData {
-            message,
-            path: None,
-        },
-    };
-    message_tx.send(Some(msg_with_data)).await;
-    Ok(())
-}
-
-async fn send_reply<W: Unpin + Write>(reply: &Message, writer: &mut W) -> io::Result<()> {
-    // Serialize reply
-    let reply =
-        serde_json::to_string_pretty(&reply).map_err(|e| io::Error::new(ErrorKind::Other, e))?;
-
-    // Send reply
-    let mut buffer = [0u8; 4];
-    BigEndian::write_u32(&mut buffer, reply.len() as u32);
-    writer.write_all(&buffer).await?;
-    writer.write_all(reply.as_bytes()).await?;
-    Ok(())
-}
-
-fn start_sending_over_socket(writer: &TcpStream, client_rx: sync::Receiver<Message>) {
-    // setup send functionality
-    let mut writer = writer.clone();
-    let _ = task::spawn(async move {
-        loop {
-            match client_rx.recv().await {
-                Ok(msg_to_send) => {
-                    if let Err(e) = send_reply(&msg_to_send, &mut writer).await {
-                        warn!("Error sending back to client: {}", e);
-                        break;
-                    }
-                }
-                Err(_) => {
-                    debug!("Stop sending task");
-                    break;
-                }
-            }
-        }
-    });
-}
-
-fn start_receiving_from_socket(
-    reader: &TcpStream,
-    tmp_installation_dir: std::path::PathBuf,
-    message_tx: sync::Sender<Option<MessageWithData>>,
-) {
-    let reader = reader.clone();
-    let _ = task::spawn(async move {
-        let mut buf_reader: io::BufReader<&TcpStream> = io::BufReader::new(&reader);
-        loop {
-            if let Err(e) =
-                receive_message_from_socket(&mut buf_reader, &message_tx, &tmp_installation_dir)
-                    .await
-            {
-                warn!("Error receiving from socket: {}", e);
-                message_tx.send(None).await;
-                break;
-            }
-        }
-    });
-}
-
-async fn connection_loop(stream: TcpStream, mut event_tx: EventTx) -> Result<(), Error> {
-    let peer = stream.peer_addr().map_err(|e| Error::GeneralIoProblem {
-        context: "Failed to get peer from command connection".to_string(),
-        error: e,
-    })?;
-    debug!("Client {:?} connected", peer);
-
-    let (notify_sender, notify_receiver) = sync::channel::<Notification>(10);
-    let subscription_id = uuid::Uuid::new_v4().to_string();
-    let subscription_event = Event::NotificationSubscription {
-        id: subscription_id.clone(),
-        subscriber: Some(notify_sender),
-    };
-    event_tx.send(subscription_event).await;
-
-    enum ConsoleEvent {
-        SystemEvent(Notification),
-        ApiMessage(MessageWithData),
-        ClientDisconnect,
+        _ => Ok(ConnectionEvent::Request(message)),
     }
-
-    let (reader, writer) = &mut (&stream, &stream);
-    let (mut message_tx, mut message_rx) = sync::channel::<Message>(1);
-
-    // channel for sending messages back to client
-    let (client_tx, client_rx) = sync::channel::<Message>(10);
-
-    let (socket_tx, socket_rx) = sync::channel::<Option<MessageWithData>>(1);
-    let tmp_installation_dir = tempdir().map_err(|e| Error::GeneralIoProblem {
-        context: "Error creating temp installation dir".to_string(),
-        error: e,
-    })?;
-
-    start_receiving_from_socket(
-        reader,
-        std::path::PathBuf::from(tmp_installation_dir.path()),
-        socket_tx,
-    );
-
-    start_sending_over_socket(writer, client_rx);
-
-    let message_event_stream: futures::stream::Map<
-        async_std::sync::Receiver<Option<MessageWithData>>,
-        _,
-    > = socket_rx.map(|m| match m {
-        Some(msg) => ConsoleEvent::ApiMessage(msg),
-        None => ConsoleEvent::ClientDisconnect,
-    });
-    let runtime_event_stream: futures::stream::Map<async_std::sync::Receiver<Notification>, _> =
-        notify_receiver.map(ConsoleEvent::SystemEvent);
-    let mut event_stream = futures::stream::select(message_event_stream, runtime_event_stream);
-
-    while let Some(event) = event_stream.next().await {
-        match event {
-            ConsoleEvent::SystemEvent(n) => {
-                let reply = Message {
-                    id: "Notification".to_owned(),
-                    payload: Payload::Notification(n),
-                };
-                client_tx.send(reply).await;
-            }
-            ConsoleEvent::ApiMessage(m) => {
-                if let Err(e) = handle_api_request(
-                    m,
-                    client_tx.clone(),
-                    &mut event_tx,
-                    &mut message_rx,
-                    &mut message_tx,
-                )
-                .await
-                {
-                    match e.kind() {
-                        ErrorKind::UnexpectedEof => info!("Client {:?} disconnected", peer),
-                        _ => warn!("Error on handle_request to {:?}: {:?}", peer, e),
-                    }
-                    break;
-                }
-            }
-            ConsoleEvent::ClientDisconnect => {
-                debug!("Client disconnect, exit connection_loop");
-                break;
-            }
-        }
-    }
-    debug!("Connection loop for peer {} finished", peer);
-    event_tx
-        .send(Event::NotificationSubscription {
-            subscriber: None,
-            id: subscription_id,
-        })
-        .await;
-
-    async fn handle_api_request(
-        m: MessageWithData,
-        sender_to_client: Sender<Message>,
-        event_tx: &mut EventTx,
-        rx_reply: &mut Receiver<Message>,
-        tx_reply: &mut Sender<Message>,
-    ) -> io::Result<()> {
-        let event = match m {
-            MessageWithData {
-                message:
-                    Message {
-                        id,
-                        payload: Payload::Installation(_),
-                    },
-                path: Some(p),
-            } => Event::Install(id, PathBuf::from(&p), tx_reply.clone()),
-            _ => Event::Console(m.message, tx_reply.clone()),
-        };
-        event_tx.send(event).await;
-
-        // Wait for reply of main loop
-        // TODO: timeout
-        let reply = rx_reply
-            .recv()
-            .await
-            .map_err(|e| io::Error::new(ErrorKind::Other, e))?;
-
-        sender_to_client.send(reply).await;
-        Ok(())
-    }
-
-    Ok(())
 }

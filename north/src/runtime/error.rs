@@ -12,7 +12,12 @@
 //   See the License for the specific language governing permissions and
 //   limitations under the License.
 
-use crate::runtime::{InstallationResult, Name};
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use super::linux::{device_mapper, mount};
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use super::linux::{inotify, loopdev};
+use super::Name;
+use crate::api::InstallationResult;
 use std::io;
 use thiserror::Error;
 
@@ -20,232 +25,146 @@ use thiserror::Error;
 pub enum Error {
     #[error("No application found")]
     ApplicationNotFound,
-    #[error("Missing resouce {0}")]
+    #[error("Application is not running")]
+    ApplicationNotRunning,
+    #[error("Missing resource {0}")]
     MissingResource(String),
-    #[error("Problem with handling process: {0}")]
-    ProcessError(ProcessError),
+    #[error("Process error: {0}")]
+    Process(super::process::Error),
     #[error("Application(s) \"{0:?}\" is/are running")]
     ApplicationRunning(Vec<Name>),
     #[error("Failed to install")]
-    InstallationError(InstallFailure),
+    Installation(InstallationError),
     #[error("Failed to uninstall")]
-    UninstallationError(InstallFailure),
-    #[error("Application is not running")]
-    ApplicationNotRunning,
-    #[error("Problem with cgroups")]
-    CGroupProblem(CGroupError),
-    #[error("Problem with keys: {0}")]
-    KeyError(KeyError),
-    #[error("OS level problem: {context}")]
-    OsProblem {
+    UninstallationError(InstallationError),
+    #[error("OS error: {context}")]
+    Os {
         context: String,
         #[source]
         error: nix::Error,
     },
-    #[error("Io problem: {context}")]
-    GeneralIoProblem {
+    #[error("IO error: {context}")]
+    Io {
         context: String,
         #[source]
         error: io::Error,
     },
-    #[error("Error with communication protocol: {0}")]
-    ProtocolError(String),
-    #[error("Configuration of runtime incorrect: {0}")]
-    ConfigurationError(String),
-}
-
-#[derive(Error, Debug)]
-pub enum ProcessError {
-    #[error("Problem starting the process: {0}")]
-    StartupError(String),
-    #[error("Problem with stopping the process")]
-    StopProblem,
-    #[error("Wrong container type: {0}")]
-    WrongContainerType(String),
+    #[error("Protocol error: {0}")]
+    Protocol(String),
+    #[error("Configuration error: {0}")]
+    Configuration(String),
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    #[error("Problem creating a minijail: {0}")]
-    MinijailProblem(#[from] minijail::Error),
-    #[error("IO problem: {context}")]
-    IoProblem {
-        context: String,
-        #[source]
-        error: io::Error,
-    },
-    #[error("Linux problem: {context}")]
-    LinuxProblem {
-        context: String,
-        #[source]
-        error: nix::Error,
-    },
+    #[error("Minijail error: {0}")]
+    Minijail(super::linux::minijail::Error),
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[error("CGroups error: {0}")]
+    CGroup(super::linux::cgroups::Error),
+    #[error("Key error: {0}")]
+    KeyError(super::keys::Error),
+    #[error("Internal error: {0}")]
+    Internal(&'static str),
+    #[error("Wrong permissions: {0}")]
+    FsPermissions(String),
 }
 
 #[derive(Error, Debug)]
-pub enum CGroupError {
-    #[error("No such cgroup found: {0}")]
-    CGroupNotFound(String),
-    #[error("Problem destroying cgroug: {context}")]
-    DestroyError {
-        context: String,
-        #[source]
-        error: io::Error,
-    },
-    #[error("Problem mounting cgroup: {context}")]
-    MountProblem {
-        context: String,
-        #[source]
-        error: Option<io::Error>,
-    },
-    #[error("File problem cgroup: {context}")]
-    FileProblem {
-        context: String,
-        #[source]
-        error: io::Error,
-    },
-}
-
-#[derive(Error, Debug)]
-pub enum KeyError {
-    #[error("File problem {context}")]
-    ProblemWithFile {
-        context: String,
-        #[source]
-        error: io::Error,
-    },
-    #[error("Key signature problen: {0}")]
-    SignatureCorrupt(String),
-}
-
-#[derive(Error, Debug)]
-pub enum InstallFailure {
-    #[error("File seems to be corrupted")]
-    FileCorrupted(#[from] zip::result::ZipError),
+pub enum InstallationError {
+    #[error("ZIP error")]
+    Zip(#[from] zip::result::ZipError),
     #[error("Signature file invalid ({0})")]
     SignatureFileInvalid(String),
-    #[error("Signature malformed")]
+    #[error("Malformed signature")]
     MalformedSignature,
     #[error("Hashes malformed ({0})")]
     MalformedHashes(String),
-    #[error("Problem verifiing the manifest ({0})")]
+    #[error("Failed to verify manifest: {0}")]
     MalformedManifest(String),
     #[error("Problem verifiing content with signature ({0})")]
-    SignatureVerificationFailed(String),
+    SignatureVerificationError(String),
     #[error("Verity device mapper problem ({0})")]
-    VerityProblem(String),
-    #[error("Verity header not found")]
+    VerityError(String),
+    #[error("Missing verity header")]
     NoVerityHeader,
-    #[error("Verity version {0} not supported")]
+    #[error("Unsupported verity version {0}")]
     UnexpectedVerityVersion(u32),
-    #[error("Verity algorithm {0} not supported")]
+    #[error("Unsupported verity algorithm: {0}")]
     UnexpectedVerityAlgorithm(String),
-    #[error("Problem with archive ({0})")]
-    ArchiveError(String),
-    #[error("Problem with device mapper")]
-    DeviceMapperProblem(DeviceMapperError),
-    #[error("Problem with loop device")]
-    LoopDeviceError(LoopDeviceError),
-    #[error("Hash is invalid ({0})")]
-    HashInvalid(String),
-    #[error("No signature key found ({0})")]
-    KeyNotFound(String),
-    #[error("Cannot install application {0}, already exists")]
+    #[error("Application {0} already installed")]
     ApplicationAlreadyInstalled(String),
-    #[error("Failure to mount: {context}")]
-    MountError {
-        context: String,
-        #[source]
-        error: nix::Error,
-    },
-    #[error("Failure to mount: {context}")]
-    INotifyError {
-        context: String,
-        #[source]
-        error: nix::Error,
-    },
-    #[error("Problem with file system: {context}")]
-    FileIoProblem {
+    #[error("Archive error: {0}")]
+    ArchiveError(String),
+    #[error("Timeout: {0}")]
+    Timeout(String),
+    #[error("Duplicate resource")]
+    DuplicateResource,
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[error("Device mapper error: {0}")]
+    DeviceMapper(device_mapper::Error),
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[error("Loop device error: {0}")]
+    LoopDeviceError(loopdev::Error),
+    #[error("Hash error: {0}")]
+    HashInvalid(String),
+    #[error("Key missing: {0}")]
+    KeyNotFound(String),
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[error("Failed to mount")]
+    Mount(#[from] mount::Error),
+    #[error("Inotify")]
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    INotify(#[from] inotify::Error),
+    #[error("IO error: {context}")]
+    Io {
         context: String,
         #[source]
         error: io::Error,
     },
-    #[error("Timeout error: {0}")]
-    TimeoutError(String),
 }
 
-impl From<InstallFailure> for InstallationResult {
-    fn from(failure: InstallFailure) -> InstallationResult {
-        match failure {
-            InstallFailure::FileCorrupted(_) => InstallationResult::FileCorrupted,
-            InstallFailure::SignatureFileInvalid(_) => InstallationResult::SignatureFileInvalid,
-            InstallFailure::MalformedSignature => InstallationResult::MalformedSignature,
-            InstallFailure::MalformedHashes(_) => InstallationResult::MalformedHashes,
-            InstallFailure::MalformedManifest(s) => InstallationResult::MalformedManifest(s),
-            InstallFailure::VerityProblem(s) => InstallationResult::VerityProblem(s),
-            InstallFailure::ArchiveError(s) => InstallationResult::ArchiveError(s),
-            InstallFailure::DeviceMapperProblem(e) => {
+impl From<InstallationError> for InstallationResult {
+    fn from(error: InstallationError) -> InstallationResult {
+        match error {
+            InstallationError::Zip(_) => InstallationResult::FileCorrupted,
+            InstallationError::SignatureFileInvalid(_) => InstallationResult::SignatureFileInvalid,
+            InstallationError::MalformedSignature => InstallationResult::MalformedSignature,
+            InstallationError::MalformedHashes(_) => InstallationResult::MalformedHashes,
+            InstallationError::MalformedManifest(s) => InstallationResult::MalformedManifest(s),
+            InstallationError::VerityError(s) => InstallationResult::VerityProblem(s),
+            InstallationError::ArchiveError(s) => InstallationResult::ArchiveError(s),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            InstallationError::DeviceMapper(e) => {
                 InstallationResult::DeviceMapperProblem(format!("{:?}", e))
             }
-            InstallFailure::LoopDeviceError(e) => {
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            InstallationError::LoopDeviceError(e) => {
                 InstallationResult::LoopDeviceError(format!("{}", e))
             }
-            InstallFailure::HashInvalid(s) => InstallationResult::HashInvalid(s),
-            InstallFailure::KeyNotFound(s) => InstallationResult::KeyNotFound(s),
-            InstallFailure::ApplicationAlreadyInstalled(_) => {
+            InstallationError::HashInvalid(s) => InstallationResult::HashInvalid(s),
+            InstallationError::KeyNotFound(s) => InstallationResult::KeyNotFound(s),
+            InstallationError::ApplicationAlreadyInstalled(_) => {
                 InstallationResult::ApplicationAlreadyInstalled
             }
-            InstallFailure::FileIoProblem { context, error: _ } => {
+            InstallationError::Io { context, error: _ } => {
                 InstallationResult::FileIoProblem(context)
             }
-            InstallFailure::MountError { context, error: _ } => {
-                InstallationResult::MountError(context)
-            }
-            InstallFailure::INotifyError { context, error: _ } => {
-                InstallationResult::INotifyError(context)
-            }
-            InstallFailure::TimeoutError(s) => InstallationResult::TimeoutError(s),
-            InstallFailure::NoVerityHeader => {
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            InstallationError::Mount(e) => InstallationResult::MountError(format!("{}", e)),
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            InstallationError::INotify(e) => InstallationResult::INotifyError(format!("{}", e)),
+            InstallationError::Timeout(s) => InstallationResult::TimeoutError(s),
+            InstallationError::NoVerityHeader => {
                 InstallationResult::VerityProblem("Verity header missing".to_string())
             }
-            InstallFailure::UnexpectedVerityAlgorithm(s) => {
+            InstallationError::UnexpectedVerityAlgorithm(s) => {
                 InstallationResult::VerityProblem(format!("Unexpected verity algorithm: {}", s))
             }
-            InstallFailure::UnexpectedVerityVersion(n) => {
+            InstallationError::UnexpectedVerityVersion(n) => {
                 InstallationResult::VerityProblem(format!("Unexpected verity version: {}", n))
             }
-            InstallFailure::SignatureVerificationFailed(s) => {
+            InstallationError::SignatureVerificationError(s) => {
                 InstallationResult::SignatureVerificationFailed(s)
             }
+            InstallationError::DuplicateResource => InstallationResult::DuplicateResource,
         }
     }
-}
-
-#[derive(Error, Debug)]
-pub enum DeviceMapperError {
-    #[error("Failure opening file for device mapper")]
-    OpenDmFailed(#[from] io::Error),
-    #[error("Failure issuing an IO-CTL call")]
-    IoCtrlFailed(#[from] nix::Error),
-    #[error("Response DM buffer requires too much space")]
-    BufferFull,
-    #[error("Failure to suspend device")]
-    SuspendDeviceFailed,
-}
-
-#[derive(Error, Debug)]
-pub enum LoopDeviceError {
-    #[error("Control file for loop device could not be created")]
-    ControlFileNotCreated(#[from] io::Error),
-    #[error("Failure to find or allocate free loop device")]
-    NoFreeDeviceFound,
-    #[error("Failure adding new loop device")]
-    DeviceAlreadyAllocated,
-    #[error("Failure to associate loop device with open file")]
-    AssociateWithOpenFile,
-    #[error("Set Loop status exceeded number of retries ({0})")]
-    StatusWriteBusy(usize),
-    #[error("Set Loop status failed")]
-    SetStatusFailed(#[from] nix::Error),
-    #[error("Failure to set DIRECT I/O mode")]
-    DirectIoModeFailed,
-    #[error("Failure to dis-associate loop device from file descriptor")]
-    ClearFailed,
 }

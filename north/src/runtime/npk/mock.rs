@@ -15,47 +15,41 @@
 use super::Container;
 use crate::{
     manifest::{Mount, Name, Version},
-    runtime::{error::InstallFailure, npk::ArchiveReader, state::State},
+    runtime::{error::InstallationError, npk::ArchiveReader, state::State},
 };
-use async_std::{
-    fs,
-    os::unix,
-    path::{Path, PathBuf},
-};
-use futures::stream::StreamExt;
 use log::{debug, info};
-use std::{io, process::Command};
+use std::{io, path::Path, process::Command};
+use tokio::{
+    fs::{self, os::unix::symlink},
+    stream::StreamExt,
+};
 
-pub async fn install_all(state: &mut State, dir: &Path) -> Result<(), InstallFailure> {
-    info!("Installing containers from {}", dir.display());
+pub async fn mount_all(state: &mut State, dir: &Path) -> Result<(), InstallationError> {
+    info!("Mounting containers from {}", dir.display());
 
     let npks = fs::read_dir(&dir)
         .await
-        .map_err(|e| InstallFailure::FileIoProblem {
+        .map_err(|e| InstallationError::Io {
             context: format!("Failed to read {}", dir.display()),
             error: e,
         })?
-        .filter_map(move |d| async move { d.ok() })
+        .filter_map(move |d| d.ok())
         .map(|d| d.path());
 
     let mut npks = Box::pin(npks);
     while let Some(npk) = npks.next().await {
-        install(state, &npk).await?;
+        mount(state, &npk).await?;
     }
     Ok(())
 }
 
-pub async fn install(
-    state: &mut State,
-    npk: &Path,
-) -> std::result::Result<(Name, Version), InstallFailure> {
+pub async fn mount(state: &mut State, npk: &Path) -> Result<(Name, Version), InstallationError> {
     if let Some(npk_name) = npk.file_name() {
         info!("Loading {}", npk_name.to_string_lossy());
     }
 
     let (manifest, (fs_offset, _fs_size)) = {
-        let mut archive_reader = ArchiveReader::new(npk.into(), &state.signing_keys)?;
-
+        let mut archive_reader = ArchiveReader::new(npk, &state.signing_keys)?;
         (
             archive_reader.extract_manifest_from_archive()?,
             archive_reader.extract_fs_start_and_size()?,
@@ -63,7 +57,7 @@ pub async fn install(
     };
 
     if state.applications.contains_key(&manifest.name) {
-        return Err(InstallFailure::ApplicationAlreadyInstalled(format!(
+        return Err(InstallationError::ApplicationAlreadyInstalled(format!(
             "Cannot install container with name {} because it already exists",
             manifest.name
         )));
@@ -77,14 +71,14 @@ pub async fn install(
             manifest.name.push_str(&format!("-{:03}", instance));
         }
 
-        let run_dir: PathBuf = state.config.directories.run_dir.as_path().into();
+        let run_dir = state.config.directories.run_dir.as_path();
         let root = run_dir.join(&manifest.name);
 
-        if root.exists().await {
+        if root.exists() {
             debug!("Removing {}", root.display());
             fs::remove_dir_all(&root)
                 .await
-                .map_err(|e| InstallFailure::FileIoProblem {
+                .map_err(|e| InstallationError::Io {
                     context: format!("Failed to remove {}", root.display()),
                     error: e,
                 })?;
@@ -98,12 +92,12 @@ pub async fn install(
         cmd.arg("-d");
         cmd.arg(root.display().to_string());
         cmd.arg(npk.display().to_string());
-        let output = cmd.output().map_err(|e| InstallFailure::FileIoProblem {
+        let output = cmd.output().map_err(|e| InstallationError::Io {
             context: format!("Output error: {}", e),
             error: e,
         })?;
         if !output.status.success() {
-            return Err(InstallFailure::FileIoProblem {
+            return Err(InstallationError::Io {
                 context: format!(
                     "Failed to unsquash: {}",
                     String::from_utf8_lossy(&output.stderr)
@@ -116,43 +110,49 @@ pub async fn install(
             match mount {
                 Mount::Bind { target, host, .. } => {
                     let source = &host;
-                    let target = root.join(target.strip_prefix("/").map_err(|_| {
-                        InstallFailure::FileIoProblem {
-                            context: "join error".to_string(),
-                            error: io::Error::new(io::ErrorKind::Other, "join error"),
-                        }
-                    })?);
+                    let target =
+                        root.join(
+                            target
+                                .strip_prefix("/")
+                                .map_err(|_| InstallationError::Io {
+                                    context: "join error".to_string(),
+                                    error: io::Error::new(io::ErrorKind::Other, "join error"),
+                                })?,
+                        );
                     // The mount points are part of the squashfs - remove them and symlink
-                    if target.exists().await {
-                        fs::remove_dir(&target).await.map_err(|e| {
-                            InstallFailure::FileIoProblem {
+                    if target.exists() {
+                        fs::remove_dir(&target)
+                            .await
+                            .map_err(|e| InstallationError::Io {
                                 context: format!("Failed to rmdir {}", target.display()),
                                 error: e,
-                            }
-                        })?;
+                            })?;
                     }
-                    unix::fs::symlink(source, &target).await.map_err(|e| {
-                        InstallFailure::FileIoProblem {
+                    symlink(source, &target)
+                        .await
+                        .map_err(|e| InstallationError::Io {
                             context: format!(
                                 "Failed to link {} to {}",
                                 source.display(),
                                 target.display()
                             ),
                             error: e,
-                        }
-                    })?;
+                        })?;
                 }
 
                 Mount::Persist { target, .. } => {
-                    let dir = root.join(target.strip_prefix("/").map_err(|_| {
-                        InstallFailure::FileIoProblem {
-                            context: "Failed to join".to_string(),
-                            error: io::Error::new(io::ErrorKind::Other, "join error"),
-                        }
-                    })?);
+                    let dir =
+                        root.join(
+                            target
+                                .strip_prefix("/")
+                                .map_err(|_| InstallationError::Io {
+                                    context: "Failed to join".to_string(),
+                                    error: io::Error::new(io::ErrorKind::Other, "join error"),
+                                })?,
+                        );
                     fs::create_dir_all(&dir)
                         .await
-                        .map_err(|e| InstallFailure::FileIoProblem {
+                        .map_err(|e| InstallationError::Io {
                             context: format!("Failed to create {}", dir.display()),
                             error: e,
                         })?;
@@ -162,7 +162,7 @@ pub async fn install(
             }
         }
 
-        info!("Installed {}:{}", manifest.name, manifest.version);
+        info!("Mounted {}:{}", manifest.name, manifest.version);
 
         let container = Container { root, manifest };
 
@@ -172,11 +172,11 @@ pub async fn install(
     Ok((manifest.name, manifest.version))
 }
 
-pub async fn uninstall(container: &Container) -> Result<(), InstallFailure> {
+pub async fn umount(container: &Container) -> Result<(), InstallationError> {
     debug!("Removing {}", container.root.display());
     fs::remove_dir_all(&container.root)
         .await
-        .map_err(|e| InstallFailure::FileIoProblem {
+        .map_err(|e| InstallationError::Io {
             context: format!("Failed to remove {}", container.root.display()),
             error: e,
         })

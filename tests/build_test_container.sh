@@ -39,5 +39,4 @@ cargo run --bin sextant -- \
   pack \
   --dir "${TMP_DIR}" \
   --out "${REGISTRY_DIR}" \
-  --key "${EXAMPLE_PRV_KEY}" \
-  --platform "${PLATFORM}"
+  --key "${EXAMPLE_PRV_KEY}"

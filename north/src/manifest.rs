@@ -12,7 +12,6 @@
 //   See the License for the specific language governing permissions and
 //   limitations under the License.
 
-use async_std::{fs, path::Path};
 use lazy_static::lazy_static;
 use serde::{
     de::{Deserializer, Visitor},
@@ -22,9 +21,11 @@ use serde::{
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    path::{Path, PathBuf},
     str::FromStr,
 };
 use thiserror::Error;
+use tokio::fs;
 
 /// A container version. Versions follow the semver format
 #[derive(Clone, PartialOrd, Hash, Eq, PartialEq)]
@@ -136,22 +137,26 @@ pub enum MountFlag {
     // NoSuid,
 }
 
-#[derive(Clone, Eq, PartialEq, Debug, Serialize)]
+#[derive(Clone, Eq, PartialEq, Debug)]
 pub enum Mount {
     Resource {
-        target: std::path::PathBuf,
+        target: PathBuf,
         name: String,
         version: Version,
-        dir: std::path::PathBuf,
+        dir: PathBuf,
     },
     Bind {
-        target: std::path::PathBuf,
-        host: std::path::PathBuf,
+        target: PathBuf,
+        host: PathBuf,
         flags: HashSet<MountFlag>,
     },
     Persist {
-        target: std::path::PathBuf,
+        target: PathBuf,
         flags: HashSet<MountFlag>,
+    },
+    Tmpfs {
+        target: PathBuf,
+        size: String,
     },
 }
 
@@ -163,7 +168,7 @@ pub struct Manifest {
     pub version: Version,
     /// Path to init
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub init: Option<std::path::PathBuf>,
+    pub init: Option<PathBuf>,
     /// Additional arguments for the application invocation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<Vec<String>>,
@@ -200,8 +205,12 @@ enum MountSource {
     Resource {
         resource: String,
     },
+    Tmpfs {
+        #[serde(deserialize_with = "deserialize_tmpfs_size")]
+        size: String,
+    },
     Bind {
-        host: std::path::PathBuf,
+        host: PathBuf,
         #[serde(default)]
         flags: HashSet<MountFlag>,
     },
@@ -209,6 +218,42 @@ enum MountSource {
         #[serde(default)]
         flags: HashSet<MountFlag>,
     },
+}
+
+fn deserialize_tmpfs_size<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct SizeVisitor;
+
+    impl<'de> Visitor<'de> for SizeVisitor {
+        type Value = String;
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a number of bytes or a string with the size (e.g. 25M)")
+        }
+
+        fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(format!("{}", v))
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            // check if the string is correctly formatted as size in tmpfs(5)
+            lazy_static! {
+                static ref TMPFS_SIZE: regex::Regex =
+                    regex::Regex::new(r"^\d+(?i:k|m|g)?$").expect("Wrong regex");
+            }
+            if TMPFS_SIZE.is_match(v) {
+                Ok(v.to_owned())
+            } else {
+                Err(E::custom("Wrong format for tmpfs size parameter"))
+            }
+        }
+    }
+
+    deserializer.deserialize_any(SizeVisitor)
 }
 
 impl MountsSerialization {
@@ -247,6 +292,9 @@ impl MountsSerialization {
                         resource: format!("{}:{}{}", name, version, dir.display()),
                     },
                 )?,
+                Mount::Tmpfs { target, size } => {
+                    map.serialize_entry(&target, &MountSource::Tmpfs { size: size.clone() })?
+                }
             }
         }
         map.end()
@@ -272,6 +320,7 @@ impl MountsSerialization {
                             host,
                             flags,
                         },
+                        MountSource::Tmpfs { size } => Mount::Tmpfs { target, size },
                         MountSource::Persist { flags } => Mount::Persist { target, flags },
                         MountSource::Resource { resource } => {
                             lazy_static! {
@@ -288,9 +337,7 @@ impl MountsSerialization {
                             let name = caps.name("name").unwrap().as_str().to_string();
                             let version = Version::parse(caps.name("version").unwrap().as_str())
                                 .map_err(serde::de::Error::custom)?;
-                            let dir = std::path::PathBuf::from(
-                                caps.name("dir").map_or("/", |m| m.as_str()),
-                            );
+                            let dir = PathBuf::from(caps.name("dir").map_or("/", |m| m.as_str()));
 
                             Mount::Resource {
                                 target,
@@ -343,15 +390,15 @@ impl Manifest {
     }
 
     /// used to find out if this manifest describes a resource container
-    pub fn is_resource_image(&self) -> bool {
+    pub fn is_resource(&self) -> bool {
         self.init.is_none()
     }
 }
 
 impl FromStr for Manifest {
     type Err = ManifestError;
-    fn from_str(s: &str) -> std::result::Result<Manifest, ManifestError> {
-        let parse_res: std::result::Result<Manifest, ManifestError> = serde_yaml::from_str(s)
+    fn from_str(s: &str) -> Result<Manifest, ManifestError> {
+        let parse_res: Result<Manifest, ManifestError> = serde_yaml::from_str(s)
             .map_err(|_| ManifestError::CouldNotParse("Failed to parse manifest".to_string()));
         if let Ok(manifest) = &parse_res {
             manifest.verify()?;
@@ -365,10 +412,9 @@ mod tests {
     use crate::manifest::*;
     use anyhow::{anyhow, Result};
 
-    #[async_std::test]
+    #[tokio::test]
     async fn parse() -> Result<()> {
-        use async_std::path::PathBuf;
-        use std::{fs::File, io::Write};
+        use std::{fs::File, io::Write, path::PathBuf};
 
         let file = tempfile::NamedTempFile::new()?;
         let path = file.path();
@@ -393,6 +439,10 @@ mounts:
           - rw
     /here/we/go:
         resource: bla:1.0.0/bin/foo
+    /tmpfs:
+        size: 42
+    /big_tmpfs:
+        size: 42G
 autostart: true
 cgroups:
   mem:
@@ -414,7 +464,7 @@ log:
 
         let manifest = Manifest::from_path(&PathBuf::from(path)).await?;
 
-        assert_eq!(manifest.init, Some(std::path::PathBuf::from("/binary")));
+        assert_eq!(manifest.init, Some(PathBuf::from("/binary")));
         assert_eq!(manifest.name, "hello");
         let args = manifest.args.ok_or_else(|| anyhow!("Missing args"))?;
         assert_eq!(args.len(), 2);
@@ -429,23 +479,31 @@ log:
         );
         let mounts = vec![
             Mount::Bind {
-                target: std::path::PathBuf::from("/lib"),
-                host: std::path::PathBuf::from("/lib"),
+                target: PathBuf::from("/lib"),
+                host: PathBuf::from("/lib"),
                 flags: [MountFlag::Rw].iter().cloned().collect(),
             },
             Mount::Persist {
-                target: std::path::PathBuf::from("/data"),
+                target: PathBuf::from("/data"),
                 flags: HashSet::new(),
             },
             Mount::Persist {
-                target: std::path::PathBuf::from("/data_rw"),
+                target: PathBuf::from("/data_rw"),
                 flags: [MountFlag::Rw].iter().cloned().collect(),
             },
             Mount::Resource {
-                target: std::path::PathBuf::from("/here/we/go"),
+                target: PathBuf::from("/here/we/go"),
                 name: "bla".to_string(),
                 version: Version::parse("1.0.0")?,
                 dir: PathBuf::from("/bin/foo").into(),
+            },
+            Mount::Tmpfs {
+                target: PathBuf::from("/tmpfs"),
+                size: "42".to_string(),
+            },
+            Mount::Tmpfs {
+                target: PathBuf::from("/big_tmpfs"),
+                size: "42G".to_string(),
             },
         ];
         assert_eq!(manifest.mounts, mounts);
@@ -487,6 +545,10 @@ mounts:
           - rw
     /here/we/go:
         resource: bla:1.0.0/bin/foo
+    /tmpfs:
+        size: 42
+    /big_tmpfs:
+        size: 42G
 autostart: true
 cgroups:
   mem:

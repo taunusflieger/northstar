@@ -20,13 +20,13 @@ use tokio::{fs, io, stream::StreamExt};
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Io error: {0} ({1})")]
-    Io(String, #[source] io::Error),
     #[error("Invalid key signature: {0}")]
     Signature(#[from] SignatureError),
+    #[error("IO error: {0}: {1:?}")]
+    Io(String, io::Error),
 }
 
-pub async fn load(key_dir: &Path) -> Result<HashMap<String, PublicKey>, Error> {
+pub(super) async fn load(key_dir: &Path) -> Result<HashMap<String, PublicKey>, Error> {
     let mut signing_keys = HashMap::new();
     let mut key_dir = fs::read_dir(&key_dir).await.map_err(|e| {
         Error::Io(
@@ -47,7 +47,7 @@ pub async fn load(key_dir: &Path) -> Result<HashMap<String, PublicKey>, Error> {
             let key_bytes = fs::read(&path)
                 .await
                 .map_err(|e| Error::Io(format!("Failed to load key from {}", path.display()), e))?;
-            let key = PublicKey::from_bytes(&key_bytes)?;
+            let key = PublicKey::from_bytes(&key_bytes).map_err(Error::Signature)?;
             signing_keys.insert(key_id, key);
         }
     }

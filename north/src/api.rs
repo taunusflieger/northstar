@@ -15,7 +15,7 @@
 use derive_new::new;
 use serde::{Deserialize, Serialize};
 
-use crate::manifest::{Manifest, Version};
+use npk::manifest::{Manifest, Version};
 
 pub type Name = String;
 pub type MessageId = String; // UUID
@@ -103,77 +103,27 @@ pub struct Memory {
 
 #[derive(new, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Response {
+    Ok(()),
     Containers(Vec<Container>),
-    Start { result: StartResult },
-    Stop { result: StopResult },
-    Uninstall { result: UninstallResult },
-    Install { result: InstallationResult },
-    Shutdown { result: ShutdownResult },
+    Err(Error),
 }
 
 #[derive(new, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
-pub enum StartResult {
-    Success,
-    Error(String),
-}
+pub enum Error {
+    ApplicationNotFound,
+    ApplicationNotRunning,
+    ApplicationRunning(String),
+    MissingResource(String),
+    ApplicationAlreadyInstalled(String),
+    ResourceAlreadyInstalled(String),
 
-#[derive(new, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
-pub enum StopResult {
-    Success,
-    Error(String), // TODO
-}
+    Npk(String),
+    Process(String),
+    Console(String),
+    Cgroups(String),
+    Mount(String),
+    Key(String),
 
-#[derive(new, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
-pub enum UninstallResult {
-    Success,
-    Error(String), // TODO
-}
-
-/// A lot can go wrong when trying to install an NPK
-#[derive(new, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
-pub enum InstallationResult {
-    /// Everything went smooth
-    Success,
-    /// Cannot install an already installed application (only 1 version can be installed)
-    ApplicationAlreadyInstalled,
-    /// Cannot install the same version a resource container (multiple versions permitted)
-    DuplicateResource,
-    /// The npk file seems to be corrupted
-    FileCorrupted,
-    /// The signature file in the npk is invalid
-    SignatureFileInvalid,
-    /// The signature file in the npk contains malformed signatures
-    MalformedSignature,
-    /// Signature check failed
-    SignatureVerificationFailed(String),
-    /// The hashes in the npk file could not be read
-    MalformedHashes,
-    /// There was a problem reading the manifest in the npk package
-    MalformedManifest(String),
-    /// Problem with the verity device
-    VerityProblem(String),
-    /// npk archive seems to be incorrecxt
-    ArchiveError(String),
-    /// Problems with the device mapper
-    DeviceMapperProblem(String),
-    /// Problems with the loopback device
-    LoopDeviceError(String),
-    /// cryptographic hash check failed
-    HashInvalid(String),
-    /// keyfile seems to be missing
-    KeyNotFound(String),
-    /// Some problem with managing files
-    FileIoProblem(String),
-    /// Mount or Un-mount problem
-    MountError(String),
-    /// A timeout occurred
-    TimeoutError(String),
-    /// Problems with Inotify
-    INotifyError(String),
-}
-
-#[derive(new, Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
-pub enum ShutdownResult {
-    Success,
-    Error(String), // TODO
+    Io(String),
+    Os(String),
 }

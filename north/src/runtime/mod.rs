@@ -12,25 +12,34 @@
 //   See the License for the specific language governing permissions and
 //   limitations under the License.
 
+mod cgroups;
 pub mod config;
-pub(self) mod console;
-pub mod error;
-pub(self) mod keys;
-#[cfg(any(target_os = "android", target_os = "linux"))]
-pub(self) mod linux;
-pub(self) mod npk;
-pub(self) mod process;
-pub(super) mod state;
+mod console;
+#[allow(unused)]
+mod device_mapper;
+mod error;
+mod keys;
+mod loopdev;
+mod minijail;
+mod mount;
+mod process;
+mod state;
 
-use crate::{api, api::Notification, manifest::Name, runtime::error::Error};
+use crate::{api, api::Notification};
 use config::Config;
 use console::Request;
-use log::*;
-use nix::{sys::stat, unistd};
+use error::Error;
+use log::{debug, info, Level};
+use nix::{
+    sys::stat,
+    unistd::{self, pipe},
+};
+use npk::manifest::Name;
 use process::ExitStatus;
 use state::State;
 use std::{
     future::Future,
+    io,
     path::Path,
     pin::Pin,
     task::{Context, Poll},
@@ -42,11 +51,11 @@ use tokio::{
     task,
 };
 
-pub type EventTx = mpsc::Sender<Event>;
+pub(crate) type EventTx = mpsc::Sender<Event>;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
-pub enum Event {
+pub(crate) enum Event {
     /// Incomming command
     Console(Request, oneshot::Sender<api::Message>),
     /// A instance exited with return code
@@ -59,14 +68,6 @@ pub enum Event {
     ChildOutput { name: Name, fd: i32, line: String },
     /// Notification events
     Notification(Notification),
-}
-
-#[derive(Clone, Debug)]
-pub enum TerminationReason {
-    /// Process was stopped by north. Normal exit
-    Stopped,
-    /// Process stopped by north because if is signalled out of memory
-    OutOfMemory,
 }
 
 /// Result of a Runtime action
@@ -82,6 +83,7 @@ pub struct Runtime {
     // channel. If a error happens during normal operation the error is also
     // sent to this channel.
     stopped: oneshot::Receiver<RuntimeResult>,
+    event_tx: mpsc::Sender<Event>,
 }
 
 impl Runtime {
@@ -90,21 +92,29 @@ impl Runtime {
         let (stopped_tx, stopped_rx) = oneshot::channel();
 
         // Initialize minijails static functionality
-        #[cfg(any(target_os = "android", target_os = "linux"))]
-        linux::minijail::init().await.map_err(Error::Minijail)?;
+        minijail_init().await?;
 
         // Ensure the configured run_dir exists
         mkdir_p_rw(&config.directories.data_dir).await?;
         mkdir_p_rw(&config.directories.run_dir).await?;
 
+        // Northstar runs in a event loop. Moduls get a Sender<Event> to the main loop.
+        let (event_tx, event_rx) = mpsc::channel::<Event>(100);
+
         // Start a task that drives the main loop and wait for shutdown results
-        task::spawn(async {
-            stopped_tx.send(runtime_task(config, stop_rx).await).ok(); // Ignore error if calle dropped the handle
-        });
+        {
+            let event_tx = event_tx.clone();
+            task::spawn(async move {
+                stopped_tx
+                    .send(runtime_task(config, event_tx, event_rx, stop_rx).await)
+                    .ok(); // Ignore error if calle dropped the handle
+            });
+        }
 
         Ok(Runtime {
             stop: Some(stop_tx),
             stopped: stopped_rx,
+            event_tx,
         })
     }
 
@@ -118,6 +128,26 @@ impl Runtime {
     pub fn stop_wait(mut self) -> impl Future<Output = RuntimeResult> {
         self.stop.take();
         self
+    }
+
+    /// Send a request to the runtime directly
+    pub async fn request(&self, request: api::Request) -> Result<api::Response, Error> {
+        let (response_tx, response_rx) = oneshot::channel::<api::Message>();
+
+        let request = api::Message::new(api::Payload::Request(request));
+        self.event_tx
+            .send(Event::Console(
+                console::Request::Message(request),
+                response_tx,
+            ))
+            .await
+            .ok();
+
+        match response_rx.await.ok().map(|message| message.payload) {
+            Some(api::Payload::Response(response)) => Ok(response),
+            Some(_) => unreachable!(),
+            None => panic!("Internal channel error"),
+        }
     }
 }
 
@@ -136,20 +166,38 @@ impl Future for Runtime {
     }
 }
 
-pub async fn runtime_task(config: Config, stop: oneshot::Receiver<()>) -> Result<(), Error> {
-    // Northstar runs in a event loop. Moduls get a Sender<Event> to the main loop.
-    let (event_tx, mut event_rx) = mpsc::channel::<Event>(100);
+async fn runtime_task(
+    config: Config,
+    event_tx: mpsc::Sender<Event>,
+    mut event_rx: mpsc::Receiver<Event>,
+    stop: oneshot::Receiver<()>,
+) -> Result<(), Error> {
     let mut state = State::new(&config, event_tx.clone()).await?;
 
     // Iterate all files in SETTINGS.directories.container_dirs and try
     // to mount the content.
     for registry in &config.directories.container_dirs {
-        npk::mount_all(&mut state, &registry)
-            .await
-            .map_err(Error::Installation)?;
+        let mounted_containers = mount::mount_npk_dir(
+            &config.directories.run_dir,
+            &state.signing_keys,
+            &config.devices.device_mapper_dev,
+            &config.devices.device_mapper,
+            &config.devices.loop_control,
+            &config.devices.loop_dev,
+            &registry,
+        )
+        .await
+        .map_err(Error::Mount)?;
+
+        for container in mounted_containers {
+            state.add(container)?;
+        }
     }
 
-    info!("Mounted {} containers", state.applications.len());
+    info!(
+        "Mounted {} containers",
+        state.applications.len() + state.resources.len()
+    );
 
     // Autostart flagged containers. Each container with the `autostart` option
     // set to true in the manifest is started.
@@ -167,7 +215,7 @@ pub async fn runtime_task(config: Config, stop: oneshot::Receiver<()>) -> Result
     // Initialize console
     let console = console::Console::new(&config.console_address, &event_tx);
     // Start to listen for incoming connections
-    console.listen().await?;
+    console.listen().await.map_err(Error::Console)?;
 
     // Wait for a external shutdown request
     let shutdown_tx = event_tx.clone();
@@ -226,15 +274,18 @@ async fn on_child_output(state: &mut State, name: &str, fd: i32, line: &str) {
 /// read and writeable
 async fn mkdir_p_rw(path: &Path) -> Result<(), Error> {
     if path.exists() && !is_rw(&path) {
-        Err(Error::FsPermissions(format!(
-            "Directory {} is not read and writeable",
-            path.display()
-        )))
+        let context = format!("Directory {} is not read and writeable", path.display());
+        Err(Error::Io(
+            context.clone(),
+            io::Error::new(io::ErrorKind::PermissionDenied, context),
+        ))
     } else {
         debug!("Creating {}", path.display());
-        fs::create_dir_all(&path).await.map_err(|error| Error::Io {
-            context: format!("Failed to create directory {}", path.display()),
-            error,
+        fs::create_dir_all(&path).await.map_err(|error| {
+            Error::Io(
+                format!("Failed to create directory {}", path.display()),
+                error,
+            )
         })
     }
 }
@@ -258,4 +309,50 @@ fn is_rw(path: &Path) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Initialize minijail logging
+pub async fn minijail_init() -> Result<(), Error> {
+    use std::{io::BufRead, os::unix::io::FromRawFd};
+
+    #[allow(non_camel_case_types)]
+    #[allow(dead_code)]
+    #[repr(i32)]
+    enum SyslogLevel {
+        LOG_EMERG = 0,
+        LOG_ALERT = 1,
+        LOG_CRIT = 2,
+        LOG_ERR = 3,
+        LOG_WARNING = 4,
+        LOG_NOTICE = 5,
+        LOG_INFO = 6,
+        LOG_DEBUG = 7,
+        MAX = i32::MAX,
+    }
+
+    if let Some(log_level) = log::max_level().to_level() {
+        let minijail_log_level = match log_level {
+            Level::Error => SyslogLevel::LOG_ERR,
+            Level::Warn => SyslogLevel::LOG_WARNING,
+            Level::Info => SyslogLevel::LOG_INFO,
+            Level::Debug => SyslogLevel::LOG_DEBUG,
+            Level::Trace => SyslogLevel::MAX,
+        };
+
+        let (readfd, writefd) =
+            pipe().map_err(|e| Error::Os("Failed to create pipe".to_string(), e))?;
+
+        let pipe = unsafe { std::fs::File::from_raw_fd(readfd) };
+        ::minijail::Minijail::log_to_fd(writefd, minijail_log_level as i32);
+
+        let mut lines = std::io::BufReader::new(pipe).lines();
+        task::spawn_blocking(move || {
+            while let Some(Ok(line)) = lines.next() {
+                // TODO: Format the logs to make them seemless
+                log::log!(log_level, "{}", line);
+            }
+        });
+    }
+
+    Ok(())
 }

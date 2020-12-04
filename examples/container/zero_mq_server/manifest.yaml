@@ -12,8 +12,7 @@ mounts:
       host: /lib64
     /system:
       host: /system
-capability_str: cap_net_r
-supplgroups_str: inet adb
+
 
 
 

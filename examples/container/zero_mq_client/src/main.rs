@@ -21,7 +21,7 @@ fn main() {
     let context = zmq::Context::new();
     let requester = context.socket(zmq::REQ).unwrap();
 
-    assert!(requester.connect("tcp://127.0.0.0:5555").is_ok());
+    assert!(requester.connect("ipc:///sockets/test.soc").is_ok());
 
     let mut msg = zmq::Message::new();
 

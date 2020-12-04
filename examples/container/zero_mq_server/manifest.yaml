@@ -12,7 +12,10 @@ mounts:
       host: /lib64
     /system:
       host: /system
-
+    /sockets:
+      host: /tmp/northstar_demo
+      flags:
+        - rw
 
 
 

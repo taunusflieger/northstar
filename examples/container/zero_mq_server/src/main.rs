@@ -20,7 +20,7 @@ fn main() {
     let context = zmq::Context::new();
     let responder = context.socket(zmq::REP).unwrap();
 
-    assert!(responder.bind("tcp://*:5555").is_ok());
+    assert!(responder.bind("ipc:///sockets/test.soc").is_ok());
 
     let mut msg = zmq::Message::new();
     loop {

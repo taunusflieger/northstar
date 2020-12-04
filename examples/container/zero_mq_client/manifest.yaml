@@ -1,0 +1,16 @@
+name: zero_mq_client
+version: 0.0.2
+init: /zero_mq_client
+env:
+  RUST_BACKTRACE: 1
+capability_str: cap_net_raw cap_mknod
+supplgroups_str: inet adb
+# autostart: true
+# instances: 20
+mounts:
+    /lib:
+      host: /lib
+    /lib64:
+      host: /lib64
+    /system:
+      host: /system

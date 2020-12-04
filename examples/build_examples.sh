@@ -111,6 +111,8 @@ main() {
     "./examples/container/resource/ferris"
     "./examples/container/resource/ferris_says_hello"
     "./examples/container/resource/hello_message"
+    "./examples/container/zero_mq_server"
+    "./examples/container/zero_mq_client"
   )
 
   local OUTPUT_DIR="./target/north/registry"

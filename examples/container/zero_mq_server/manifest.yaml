@@ -1,0 +1,36 @@
+name: zero_mq_server
+version: 0.0.2
+init: /zero_mq_server
+env:
+  RUST_BACKTRACE: 1
+# autostart: true
+# instances: 20
+mounts:
+    /lib:
+      host: /lib
+    /lib64:
+      host: /lib64
+    /system:
+      host: /system
+capability_str: cap_net_r
+supplgroups_str: inet adb
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

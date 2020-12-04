@@ -15,7 +15,10 @@ members = [
     "examples/container/hello",
     "examples/container/memeater",
     "examples/container/resource/ferris",
+    "examples/container/zero_mq_server",
+    "examples/container/zero_mq_client",
 ]
+
 
 [profile.dev]
 panic = "abort"

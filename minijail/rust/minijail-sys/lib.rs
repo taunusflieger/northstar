@@ -3,7 +3,6 @@
 // found in the LICENSE file.
 
 /// libminijail bindings for Rust.
-
 // TODO(crbug.com/1032672): Generate bindings at build time.
 //
 // Bindgen will invoke the C preprocessor to process headers, which means that the bindings
@@ -37,6 +36,10 @@
 //
 // Enum variants in rust are customarily camel case, but bindgen will leave the original names
 // intact.
+
+// Explicitly link libcap
+extern crate libcap_sys;
+
 #[allow(non_camel_case_types)]
 mod libminijail;
 pub use crate::libminijail::*;

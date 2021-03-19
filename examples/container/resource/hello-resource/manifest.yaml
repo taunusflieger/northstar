@@ -1,0 +1,19 @@
+name: hello-resource
+version: 0.0.1
+init: /hello-resource
+uid: 1000
+gid: 1000
+mounts:
+  /lib:
+    host: /lib
+  /lib64:
+    host: /lib64
+  /message:
+    resource: message:0.0.2:/
+  /system:
+    host: /system
+io:
+  stdout:
+    log:
+      - DEBUG
+      - hello

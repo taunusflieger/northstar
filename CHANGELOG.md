@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+* Synchronize access to the loopback control file (run multiple northstar instances
+  in parallel)
+* Mount container in parallel
+* Fix integration test log assumptions
+* Use `api::client::Client` for interfacing the runtime in integration tests
+* Add `api::client::Client::mount/umount`
+* Remove the `install/uninstall` and `request` from `runtime::Runtime`
+* Add UID and GID setting to the manifest. The values are used for preparing
+  the squashfs image and when a container is started.
+* Add a Rust API client that implements the Northstar API protocol. See
+  `northstar::api::client`.
+* Exchange the length encoded wire format with newline seperated json.
+* Upgrade to Tokio 1.0
+* Rename the default configuration file from north.toml to northstar.toml
+* The `[directories]` section in the `north.toml` configuration file is replaced
+  by multiple `[repositories.<name>]` sections. Where each corresponds to a
+  directory previously specified in the `container_dirs` parameter. The
+  specified `<name>` corresponds to the __repository identifier__.
+* Each `[repositories.<name>]` section has a `dir`, `writable` and an optional
+  `key` parameter. Where `dir` is the directory containing the `npk` files,
+  `writable` indicates whether cotainers can be installed or uninstalled to this
+  repository and `key` is the path to the public signature file.
+* To install a container, a __repository identifier__ is required to indicate
+  the destination where the container will be installed.
+* If the `key` parameter is unspecified, the containers from the repository are
+  mounted without being verified using `verity`.
 
 ## [0.6.0] - 2020-11-22
 ### Added
@@ -29,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 * Installation of packages:
-  When a package is installed, it is now streamed to the north daemon
+  When a package is installed, it is now streamed to the northstar daemon
 * Dedicated error types instead of generic anyhow errors
 * Resource-Containers: now multiple versions are possible
 * nstar is now implemented with tokio

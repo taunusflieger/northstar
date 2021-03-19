@@ -4,9 +4,9 @@ To run the examples, you first need to create the `NPK`s for the architecture yo
 
 To build the examples, you can use the shell-script in the examples folder.
 
-Once you have the `*.npk` packages in your registry, you can start the northstar process and configure this registry.
+Once you have the `*.npk` packages in your repository, you can start the northstar process and configure this repository.
 
-To build and run the north runtime, you can simple execute a `cargo run` which will start the
+To build and run the northstar runtime, you can simple execute a `cargo run` which will start the
 runtime.
 
 When the northstar runtime is up and running, you can issue control commands to it via a socket.

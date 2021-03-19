@@ -1,20 +1,23 @@
 [workspace]
-
 members = [
-    "minijail/rust/minijail",
-    "minijail/rust/minijail-sys",
-    "north",
-    "npk",
-    "nstar",
-    "sextant",
-    "north_tests",
-    "north_tests/test_container",
+    "examples/container/capabilities",
     "examples/container/cpueater",
     "examples/container/crashing",
     "examples/container/datarw",
-    "examples/container/hello",
+    "examples/container/hello-world",
     "examples/container/memeater",
     "examples/container/resource/ferris",
+    "examples/container/resource/hello-resource",
+    "examples/container/seccomp",
+    "libcap-sys",
+    "minijail/rust/minijail",
+    "minijail/rust/minijail-sys",
+    "northstar",
+    "northstar_tests",
+    "northstar_tests/test_container",
+    "npk",
+    "nstar",
+    "sextant",
 ]
 
 [profile.dev]

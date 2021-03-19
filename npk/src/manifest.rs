@@ -31,11 +31,21 @@ use thiserror::Error;
 pub struct Version(pub semver::Version);
 
 pub type Name = String;
+pub type CGroup = HashMap<String, String>;
+pub type CGroups = HashMap<String, CGroup>;
 
 impl Version {
     #[allow(dead_code)]
     pub fn parse(s: &str) -> Result<Version, semver::SemVerError> {
         Ok(Version(semver::Version::parse(s)?))
+    }
+}
+
+impl FromStr for Version {
+    type Err = semver::SemVerError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
     }
 }
 
@@ -65,6 +75,10 @@ impl<'de> Deserialize<'de> for Version {
 
         impl<'de> Visitor<'de> for VersionVisitor {
             type Value = Version;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> ::std::fmt::Result {
+                formatter.write_str("string v0.0.0")
+            }
+
             fn visit_str<E>(self, str_data: &str) -> Result<Version, E>
             where
                 E: serde::de::Error,
@@ -72,10 +86,6 @@ impl<'de> Deserialize<'de> for Version {
                 semver::Version::parse(str_data).map(Version).map_err(|_| {
                     serde::de::Error::invalid_value(::serde::de::Unexpected::Str(str_data), &self)
                 })
-            }
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> ::std::fmt::Result {
-                formatter.write_str("string v0.0.0")
             }
         }
 
@@ -100,27 +110,6 @@ pub enum OnExit {
     /// Container is restarted n number and not started anymore after n exits
     #[serde(rename = "restart")]
     Restart(u32),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CGroupMem {
-    /// Limit im bytes
-    pub limit: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CGroupCpu {
-    /// CPU shares assigned to this container. CGroups cpu divide
-    /// the ressource CPU into 1024 shares
-    pub shares: u32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CGroups {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mem: Option<CGroupMem>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu: Option<CGroupCpu>,
 }
 
 #[derive(Clone, Eq, PartialEq, Debug, Hash, Serialize, Deserialize)]
@@ -166,7 +155,29 @@ pub enum Mount {
     Tmpfs { size: u64 },
 }
 
+/// IO configuration for stdin, stdout, stderr
 #[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+pub struct Io {
+    /// stdout configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<Output>,
+    /// stderr configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<Output>,
+}
+
+#[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+pub enum Output {
+    /// Inherit the runtimes stdout/stderr
+    #[serde(rename = "pipe")]
+    Pipe,
+    /// Forward output to the logging system with level and optional tag
+    #[serde(rename = "log")]
+    Log { level: log::Level, tag: String },
+}
+
+#[derive(Clone, Eq, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// Name of container
     pub name: Name,
@@ -178,25 +189,22 @@ pub struct Manifest {
     /// Additional arguments for the application invocation
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<Vec<String>>,
+    /// UID
+    pub uid: u32,
+    /// GID
+    pub gid: u32,
     /// Environment passed to container
     #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
-    /// Autostart this container upon north startup
+    /// Autostart this container upon northstar startup
     #[serde(skip_serializing_if = "Option::is_none")]
     pub autostart: Option<bool>,
-    /// Action on application exit
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub on_exit: Option<OnExit>,
     /// CGroup config
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cgroups: Option<CGroups>,
     /// Seccomp configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seccomp: Option<HashMap<String, String>>,
-    /// Number of instances to mount of this container
-    /// The name get's extended with the instance id.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub instances: Option<u32>,
     /// List of bind mounts and resources
     #[serde(
         with = "MountsSerialization",
@@ -204,6 +212,16 @@ pub struct Manifest {
     )]
     #[serde(default)]
     pub mounts: HashMap<PathBuf, Mount>,
+    /// String containing capability names to give to
+    /// new container
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
+    /// String containing group names to give to new container
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppl_groups: Option<Vec<String>>,
+    /// IO configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io: Option<Io>,
 }
 
 /// Configuration for the persist mounts
@@ -326,7 +344,7 @@ impl MountsSerialization {
                     Mount::Resource { name, version, dir } => map.serialize_entry(
                         &target,
                         &MountSource::Resource {
-                            resource: format!("{}:{}{}", name, version, dir.display()),
+                            resource: format!("{}:{}:{}", name, version, dir.display()),
                         },
                     )?,
                     Mount::Tmpfs { size } => {
@@ -345,6 +363,10 @@ impl MountsSerialization {
         struct MountVectorVisitor;
         impl<'de> Visitor<'de> for MountVectorVisitor {
             type Value = HashMap<PathBuf, Mount>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> ::std::fmt::Result {
+                formatter.write_str("{ /path/a: Bind {} | Persist {} | Resource {}, /path/b: ... }")
+            }
 
             fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
             where
@@ -384,7 +406,7 @@ impl MountsSerialization {
                             MountSource::Resource { resource } => {
                                 lazy_static! {
                                     static ref RE: regex::Regex = regex::Regex::new(
-                                        r"(?P<name>((\w|-|\.|_)+)):(?P<version>\d+\.\d+\.\d+)(?P<dir>[\w/]+)"
+                                        r"(?P<name>((\w|-|\.|_)+)):(?P<version>\d+\.\d+\.\d+):(?P<dir>[\w/]+)"
                                     )
                                     .expect("Invalid regex");
                                 }
@@ -415,10 +437,6 @@ impl MountsSerialization {
                 }
                 Ok(entries)
             }
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> ::std::fmt::Result {
-                formatter.write_str("{ /path/a: Bind {} | Persist {} | Resource {}, /path/b: ... }")
-            }
         }
 
         deserializer.deserialize_map(MountVectorVisitor)
@@ -426,20 +444,35 @@ impl MountsSerialization {
 }
 
 #[derive(Error, Debug)]
-pub enum ManifestError {
-    #[error("Invalid manifest ({0})")]
+pub enum Error {
+    #[error("Invalid manifest: {0}")]
     Invalid(String),
-    #[error("Failed to parse: {0}")]
-    Parse(#[from] serde_yaml::Error),
-    #[error("IO: {0}")]
-    Io(#[from] io::Error),
+    #[error("Failed to parse YAML format: {0}")]
+    SerdeYaml(#[from] serde_yaml::Error),
 }
 
 impl Manifest {
-    fn verify(&self) -> Result<(), ManifestError> {
-        // TODO: check for none on env, autostart, cgroups, seccomp, instances
+    /// Manifest version supported by the runtime
+    pub const VERSION: Version = Version(semver::Version {
+        major: 0,
+        minor: 0,
+        patch: 3,
+        pre: vec![],
+        build: vec![],
+    });
+
+    pub fn from_reader<R: io::Read>(reader: R) -> Result<Self, Error> {
+        serde_yaml::from_reader(reader).map_err(Error::SerdeYaml)
+    }
+
+    pub fn to_writer<W: io::Write>(&self, writer: W) -> Result<(), Error> {
+        serde_yaml::to_writer(writer, self).map_err(Error::SerdeYaml)
+    }
+
+    fn verify(&self) -> Result<(), Error> {
+        // TODO: check for none on env, autostart, cgroups, seccomp
         if self.init.is_none() && self.args.is_some() {
-            return Err(ManifestError::Invalid(
+            return Err(Error::Invalid(
                 "Arguments not allowed in resource container".to_string(),
             ));
         }
@@ -448,14 +481,22 @@ impl Manifest {
 }
 
 impl FromStr for Manifest {
-    type Err = ManifestError;
-    fn from_str(s: &str) -> Result<Manifest, ManifestError> {
-        let parse_res: Result<Manifest, ManifestError> =
-            serde_yaml::from_str(s).map_err(ManifestError::Parse);
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Manifest, Error> {
+        let parse_res: Result<Manifest, Error> = serde_yaml::from_str(s).map_err(Error::SerdeYaml);
         if let Ok(manifest) = &parse_res {
             manifest.verify()?;
         }
         parse_res
+    }
+}
+
+impl ToString for Manifest {
+    fn to_string(&self) -> String {
+        // A `Manifest` is convertible to `String` as long as its implementation of `Serialize` does
+        // not return an error. This should never happen for the types that we use in `Manifest` so
+        // we can safely use .unwrap() here.
+        serde_yaml::to_string(self).unwrap()
     }
 }
 
@@ -475,6 +516,15 @@ args:
   - two
 env:
   LD_LIBRARY_PATH: /lib
+uid: 1000
+gid: 1001
+suppl_groups:
+  - inet
+  - log
+capabilities:
+  - cap_net_raw
+  - cap_mknod
+  - cap_sys_time
 mounts:
   /tmp:
     tmpfs: 42
@@ -485,20 +535,16 @@ mounts:
       - rw
   /data: persist
   /resource:
-    resource: bla-blah.foo:1.0.0/bin/foo
+    resource: bla-blah.foo:1.0.0:/bin/foo
 autostart: true
 cgroups:
-  mem:
-    limit: 30
+  memory:
+    limit_in_bytes: 30
   cpu:
     shares: 100
 seccomp:
-    fork: 1
-    waitpid: 1
-log:
-    tag: test
-    buffer:
-        custom: 8
+  fork: 1
+  waitpid: 1
 ";
 
         let manifest = Manifest::from_str(&manifest)?;
@@ -516,6 +562,8 @@ log:
             env.get("LD_LIBRARY_PATH"),
             Some("/lib".to_string()).as_ref()
         );
+        assert_eq!(manifest.uid, 1000);
+        assert_eq!(manifest.gid, 1001);
         let mut mounts = HashMap::new();
         mounts.insert(
             PathBuf::from("/lib"),
@@ -536,18 +584,34 @@ log:
         mounts.insert(PathBuf::from("/tmp"), Mount::Tmpfs { size: 42 });
         mounts.insert(PathBuf::from("/dev"), Mount::Dev { r#type: Dev::Full });
         assert_eq!(manifest.mounts, mounts);
-        assert_eq!(
-            manifest.cgroups,
-            Some(CGroups {
-                mem: Some(CGroupMem { limit: 30 }),
-                cpu: Some(CGroupCpu { shares: 100 }),
-            })
-        );
+
+        let mut cgroups = HashMap::new();
+        let mut mem = HashMap::new();
+        let mut cpu = HashMap::new();
+        mem.insert("limit_in_bytes".to_string(), "30".to_string());
+        cpu.insert("shares".to_string(), "100".to_string());
+        cgroups.insert("memory".to_string(), mem);
+        cgroups.insert("cpu".to_string(), cpu);
+
+        assert_eq!(manifest.cgroups, Some(cgroups));
 
         let mut seccomp = HashMap::new();
         seccomp.insert("fork".to_string(), "1".to_string());
         seccomp.insert("waitpid".to_string(), "1".to_string());
         assert_eq!(manifest.seccomp, Some(seccomp));
+
+        assert_eq!(
+            manifest.capabilities,
+            Some(vec!(
+                "cap_net_raw".to_string(),
+                "cap_mknod".to_string(),
+                "cap_sys_time".to_string()
+            ))
+        );
+        assert_eq!(
+            manifest.suppl_groups,
+            Some(vec!("inet".to_string(), "log".to_string()))
+        );
 
         Ok(())
     }
@@ -559,9 +623,11 @@ log:
 name: hello
 version: 0.0.0
 init: /binary
+uid: 1000
+gid: 1001
 mounts:
-  /dev: full 
-  /dev: full 
+  /dev: full
+  /dev: full
 ";
         assert!(Manifest::from_str(manifest).is_err());
 
@@ -574,6 +640,8 @@ mounts:
 name: hello
 version: 0.0.0
 init: /binary
+uid: 1000
+gid: 1001
 mounts:
   /a:
     tmpfs: 100
@@ -585,21 +653,25 @@ mounts:
     tmpfs: 100g
 ";
         let manifest = Manifest::from_str(manifest).unwrap();
-        assert!(manifest.mounts.get(&PathBuf::from("/a")) == Some(&Mount::Tmpfs { size: 100 }));
-        assert!(
-            manifest.mounts.get(&PathBuf::from("/b")) == Some(&Mount::Tmpfs { size: 100 * 1024 })
+        assert_eq!(
+            manifest.mounts.get(&PathBuf::from("/a")),
+            Some(&Mount::Tmpfs { size: 100 })
         );
-        assert!(
-            manifest.mounts.get(&PathBuf::from("/c"))
-                == Some(&Mount::Tmpfs {
-                    size: 100 * 1024 * 1024
-                })
+        assert_eq!(
+            manifest.mounts.get(&PathBuf::from("/b")),
+            Some(&Mount::Tmpfs { size: 100 * 1024 })
         );
-        assert!(
-            manifest.mounts.get(&PathBuf::from("/d"))
-                == Some(&Mount::Tmpfs {
-                    size: 100 * 1024 * 1024 * 1024
-                })
+        assert_eq!(
+            manifest.mounts.get(&PathBuf::from("/c")),
+            Some(&Mount::Tmpfs {
+                size: 100 * 1024 * 1024
+            })
+        );
+        assert_eq!(
+            manifest.mounts.get(&PathBuf::from("/d")),
+            Some(&Mount::Tmpfs {
+                size: 100 * 1024 * 1024 * 1024
+            })
         );
 
         // Test a invalid tmpfs size string
@@ -607,6 +679,8 @@ mounts:
 name: hello
 version: 0.0.0
 init: /binary
+uid: 1000
+gid: 1001
 mounts:
   /tmp:
     tmpfs: 100M
@@ -620,6 +694,8 @@ mounts:
 name: hello
 version: 0.0.0
 init: /binary
+uid: 1000
+gid: 1001
 mounts:
   /dev:
     tmpfs: 42
@@ -628,24 +704,28 @@ mounts:
     }
 
     #[test]
-    fn mount_ressource() {
+    fn mount_resource() {
         let manifest = "
 name: hello
 version: 0.0.0
 init: /binary
+uid: 1000
+gid: 1001
 mounts:
   /foo:
-    resource: foo-bar.qwerty12:0.0.1/
+    resource: foo-bar.qwerty12:0.0.1:/
 ";
         Manifest::from_str(manifest).unwrap();
     }
 
     #[test]
-    fn serialize_back_and_forth() -> Result<()> {
+    fn roundtrip() -> Result<()> {
         let m = "
 name: hello
 version: 0.0.0
 init: /binary
+uid: 1000
+gid: 1001
 args:
   - one
   - two
@@ -658,23 +738,26 @@ mounts:
       - rw
   /data: persist
   /resource:
-    resource: bla-bar.blah1234:1.0.0/bin/foo
+    resource: bla-bar.blah1234:1.0.0:/bin/foo
   /tmp:
     tmpfs: 42
   /dev: full
 autostart: true
 cgroups:
-  mem:
-    limit: 30
+  memory:
+    limit_in_bytes: 30
   cpu:
     shares: 100
 seccomp:
   fork: 1
   waitpid: 1
-log:
-  tag: test
-  buffer:
-    custom: 8
+io:
+  stdin: pipe
+  stdout: 
+    log:
+      - DEBUG
+      - test
+  stderr: pipe
 ";
 
         let manifest = serde_yaml::from_str::<Manifest>(m)?;

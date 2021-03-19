@@ -1,0 +1,11 @@
+[package]
+name = "test_container"
+version = "0.1.0"
+authors = ["ESRLabs"]
+edition = "2018"
+
+[dependencies]
+anyhow = "1.0.37"
+structopt = "0.3.21"
+nix = "0.19.1"
+url = "1.4.1"

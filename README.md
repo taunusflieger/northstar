@@ -54,7 +54,7 @@ So far we tested Northstar on
 
 ### Northstar Packages (NPK)
 
-Similar as in the docker world, a Northstar **image** is the unit that gets deployed into a system. Once the runtime starts, all images in the registry will be loaded into **containers**. Containers are the entities that are managed by the Northstar runtime.
+Similar as in the docker world, a Northstar **image** is the unit that gets deployed into a system. Once the runtime starts, all images in the repositiry will be loaded into **containers**. Containers are the entities that are managed by the Northstar runtime.
 
 Images are packaged as **Northstar Packages** or **NPK**s. At it's outer layer, such an NPK is just a plain zip-archive. The content looks like this:
 
@@ -123,7 +123,7 @@ SUBCOMMANDS:
 In order to create your own northstar packages, you will also need to generate a keypair that
 subsequently will be used to generate and verify the signatures of your images.
 
-Once the packages are created, they are stored in a registry directory. This registry needs to be configured later when starting the northstar runtime.
+Once the packages are created, they are stored in a repository directory. This repository needs to be configured later when starting the northstar runtime.
 
 ## Configuring and Running Northstar
 
@@ -148,33 +148,48 @@ The script in `doc/tools/check_conf.sh` can be used to check your running kernel
 Open a terminal, clone the repository and build the solution and start the runtime:
 
     $ git clone https://github.com/esrlabs/northstar.git
-    $ cargo build --release --bin north 
-    $ cargo build --release --bin nstar 
-    $ ./examples/build_examples.sh 
-    $ sudo ./target/release/north
+    $ cargo build --release --bin northstar
+    $ cargo build --release --bin nstar
+    $ sudo ./target/release/northstar
+
+#### Build example containers
+The `examples/build_examples.sh` script can be used got build all the example
+containers inside the `example` folder.
+
+The containers are built for the host platform by default. The flag `-t,--target` can be used to build the containers for a different platform.
+
+    $ ./examples/build_examples.sh --help
+	USAGE:
+	    build_examples.sh [OPTIONS]
+
+	OPTIONS:
+	    -t, --target <platform>   Target platform
+	    -c, --comp   <algorithm>  Compression algorithm used by squashfs
+	                              (gzip, lzma, lzo, xz, zstd)
+	    -h, --help                Prints help information
 
 ### Run sample code
 Open a second terminal navigate to the directory where the northstar source is located. Start `nstar` to interact with the runtime.
 Execute the following commands:
 
 1. `containers` to list all registered containers
-2. `start crashing` to start an example container which will crash within the next 10 seconds 
+2. `start crashing` to start an example container which will crash within the next 10 seconds
 
-[//]: # 
- 
+[//]: #
+
 
     $ ./target/release/nstar
     $ >> containers
-    Name              | Version | Type     | PID | Uptime 
+    Name              | Version | Type     | PID | Uptime
     -------------------+---------+----------+-----+--------
-    cpueater          | 0.0.1   | App      |     |  
-    crashing          | 0.0.1   | App      |     |  
-    datarw            | 0.0.1   | App      |     |  
-    ferris_says_hello | 0.0.3   | App      |     |  
-    hello             | 0.0.2   | App      |     |  
-    memeater          | 0.0.1   | App      |     |  
-    ferris            | 0.0.2   | Resource |     |  
-    hello_message     | 0.1.2   | Resource |     |  
+    cpueater          | 0.0.1   | App      |     |
+    crashing          | 0.0.1   | App      |     |
+    datarw            | 0.0.1   | App      |     |
+    ferris_says_hello | 0.0.3   | App      |     |
+    hello             | 0.0.2   | App      |     |
+    memeater          | 0.0.1   | App      |     |
+    ferris            | 0.0.2   | Resource |     |
+    hello_message     | 0.1.2   | Resource |     |
     >> start crashing
     crashing-0.0.1 was started
     start succeeded
@@ -188,54 +203,54 @@ Execute the following commands:
 The Northstar runtime is an executable and usually run as a daemon started by your system manager of choice. It can be started with a config file.
 
 ```shell
-North
+Northstar
 
 USAGE:
-    north [FLAGS] [OPTIONS]
+    northstar [FLAGS] [OPTIONS]
 
 FLAGS:
-    -d, --debug      Print debug logs
     -h, --help       Prints help information
     -V, --version    Prints version information
 
 OPTIONS:
-    -c, --config <config>    File that contains the north configuration [default: north.toml]
+    -c, --config <config>    File that contains the northstar configuration [default: northstar.toml]
 ```
 
 The configuration of the runtime is done with a `*.toml` configuration file.
 Here is an example:
 
 ```toml
-debug = true
-console_address = "localhost:4200"
-container_uid = 1000
-container_gid = 1000
+log_level = "DEBUG"
+console = "tcp://localhost:4200"
+run_dir = "target/northstar/run"
+data_dir = "target/northstar/data"
 
-[directories]
-container_dirs = [ "target/north/registry" ]
-run_dir = "target/north/run"
-data_dir = "target/north/data"
-key_dir = "examples/keys"
+[repositories.default]
+dir = "target/northstar/repository"
+writable = true
+key = "examples/keys/northstar.pub"
+
 
 [cgroups]
-memory = "north"
-cpu = "north"
+memory = "northstar"
+cpu = "northstar"
 
 [devices]
 unshare_root = "/"
-unshare_fstype = "ext4"
 loop_control = "/dev/loop-control"
 loop_dev = "/dev/loop"
 device_mapper = "/dev/mapper/control"
 device_mapper_dev = "/dev/dm-"
 ```
 
-The `[directories]` section just tells north what directories to use.
+The `[repositories.default]` sections describes a container repository named `default`.
+Within it, the following options can be specified:
 
-* **`container_dir`** -- list of directories where to find the `*.npk` packages for the correct architecture
-  are to be found
-* **`run_dir`** -- where the container content will be mounted
-* **`data_dir`** -- In data_dir a directory for each container is created if a mount of type data is used in the manifest
+* **`dir`** -- The directory where to find `*.npk` packages for the correct architecture.
+* **`key`** -- The path to the public signing key used to sign the containers.
+
+Multiple `[repositories.<name>]` sections can be specified for separate
+repositories, where `<name>` is the __repository identifier__.
 
 The [`cgroups`] optionally configures northstar applications CGroups settings.
 Both `memory` and `cpu` will tell northstar where to mount the cgroup hierarchies.
@@ -243,11 +258,12 @@ Both `memory` and `cpu` will tell northstar where to mount the cgroup hierarchie
 `[devices]`-section:
 
 * **`unshare_root`** -- Set to mountpoint of the fs containing run_dir. The runtime needs this directory to set the mount propagation to MS_PRIVATE.
-* **`unshare_fstype`** -- For applying the mount propagation type the fs type is needed.
 * **`loop_control`** -- Location of the loopback block device control file
 * **`loop_dev`** -- Prefix of preconfigured loopback devices. Usually loopback devices are e.g /dev/block0
 * **`device_mapper`** -- Device mapper control file.
 * **`device_mapper_dev`** -- Prefix of device mapper mappings.
+* **`run_dir`** -- where the container content will be mounted
+* **`data_dir`** -- In data_dir a directory for each container is created if a mount of type data is used in the manifest
 
 ## Controlling the runtime
 

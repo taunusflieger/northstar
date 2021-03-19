@@ -20,11 +20,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if MUSL_C
-#include <linux/capability.h>
-#else
-#include <sys/capability.h>
-#endif
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/prctl.h>
@@ -45,6 +40,13 @@
 #include "syscall_wrapper.h"
 #include "system.h"
 #include "util.h"
+
+/*
+ * To avoid issues with Android and the MUSL toolchain,
+ * we compile the functions we need from the capability
+ * library directly
+ */
+#include "libcap/include/sys/capability.h"
 
 /* Until these are reliably available in linux/prctl.h. */
 #ifndef PR_ALT_SYSCALL
@@ -1936,9 +1938,6 @@ static void drop_capbset(uint64_t keep_mask, unsigned int last_valid_cap)
 
 static void drop_caps(const struct minijail *j, unsigned int last_valid_cap)
 {
-	(void)j;
-	(void)last_valid_cap;
-#if 0
 	if (!j->flags.use_caps)
 		return;
 
@@ -2032,7 +2031,6 @@ static void drop_caps(const struct minijail *j, unsigned int last_valid_cap)
 	}
 
 	cap_free(caps);
-#endif
 }
 
 static void set_seccomp_filter(const struct minijail *j)
@@ -3286,4 +3284,50 @@ void API minijail_destroy(struct minijail *j)
 void API minijail_log_to_fd(int fd, int min_priority)
 {
 	init_logging(LOG_TO_FD, fd, min_priority);
+}
+
+/*
+ * Called in thread context when launching a container
+ *
+ * Since we are specifying the capability vector that will
+ * be present in the new process (after execve), we have to
+ * explicitly allow those capabilities to be ambient. This
+ * is the equivalent of specifying --ambient on the MJ command
+ * line. To quote from the minijail man page:
+ *
+ *	Raise ambient capabilities to match the mask specified
+ *	by -c.  Since ambient capabilities are preserved across
+ *	execve(2), this allows for process trees to have a restricted
+ *	set of capabilities, even if  they  are  capability-dumb  binaries
+ */
+int API minijail_update_caps(struct minijail *j, char *capstr)
+{
+	int error;
+	uint64_t capval = 0;
+
+	error = minijail_parse_caps(capstr, &capval);
+	if (error == 0) {
+		minijail_use_caps(j, capval);
+		minijail_set_ambient_caps(j);
+	}
+
+	return error;
+}
+
+/*
+ * Called in thread context when launching a container
+ */
+int API minijail_update_suppl_groups(struct minijail *j, char *groups)
+{
+	int error, gidcnt;
+	gid_t *gidbuf = NULL;
+
+	error = minijail_parse_groups(groups, &gidcnt, &gidbuf);
+	if (error == 0)
+		minijail_set_supplementary_gids(j, gidcnt, gidbuf);
+
+	if (gidbuf)
+		free(gidbuf);
+
+	return error;
 }

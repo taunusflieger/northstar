@@ -25,15 +25,24 @@ mod inspect;
 enum Opt {
     /// Pack Northstar containers
     Pack {
-        /// Container source dir
+        /// Manifest path
         #[structopt(short, long)]
-        dir: PathBuf,
+        manifest: PathBuf,
+        /// Container source directory
+        #[structopt(short, long)]
+        root: PathBuf,
         /// Key file
         #[structopt(short, long)]
-        key: PathBuf,
+        key: Option<PathBuf>,
         /// Output directory
         #[structopt(short, long)]
         out: PathBuf,
+        /// Compression algorithm to use in squashfs (default gzip)
+        #[structopt(short, long)]
+        comp: Option<npk::npk::CompressionAlgorithm>,
+        /// Block size used by squashfs (default 128 KiB)
+        #[structopt(short, long)]
+        block_size: Option<u32>,
     },
     /// Unpack Northstar containers
     Unpack {
@@ -46,6 +55,8 @@ enum Opt {
     },
     /// Print information about a Northstar container
     Inspect {
+        #[structopt(short, long)]
+        short: bool,
         /// NPK to inspect
         npk: PathBuf,
     },
@@ -59,14 +70,25 @@ enum Opt {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     env_logger::init();
 
     match Opt::from_args() {
-        Opt::Pack { dir, out, key } => npk::npk::pack(&dir, &out, &key)?,
-        Opt::Unpack { npk, out } => npk::npk::unpack(&npk, &out)?,
-        Opt::Inspect { npk } => inspect::inspect(&npk)?,
-        Opt::GenKey { name, out } => npk::npk::gen_key(&name, &out)?,
+        Opt::Pack {
+            manifest,
+            root,
+            out,
+            key,
+            comp,
+            block_size,
+        } => {
+            let squashfs_opts = npk::npk::SquashfsOpts { comp, block_size };
+            npk::npk::pack_with(&manifest, &root, &out, key.as_deref(), squashfs_opts).await?
+        }
+        Opt::Unpack { npk, out } => npk::npk::unpack(&npk, &out).await?,
+        Opt::Inspect { npk, short } => inspect::inspect(&npk, short).await?,
+        Opt::GenKey { name, out } => npk::npk::gen_key(&name, &out).await?,
     }
     Ok(())
 }

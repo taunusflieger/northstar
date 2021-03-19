@@ -1,0 +1,25 @@
+---
+# Use the ferris interpreter from the resouce listed below
+name: hello-ferris
+version: 0.0.1
+init: /bin/ferris
+uid: 1000
+gid: 1000
+args:
+  - /message/hello
+mounts:
+    /bin:
+      resource: ferris:0.0.1:/
+    /lib:
+      host: /lib
+    /lib64:
+      host: /lib64
+    /system:
+      host: /system
+    /message:
+      resource: message:0.0.1:/
+io:
+  stdout:
+    log:
+      - DEBUG
+      - ferris

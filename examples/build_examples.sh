@@ -10,12 +10,48 @@ this_script=$(basename $0)
 bold=$(tput bold)
 normal=$(tput sgr0)
 
-if [ -z ${1+x} ]
-then
-  PLATFORM="host"
-else
-  PLATFORM=${1}
-fi
+usage() {
+    echo "USAGE:"
+    echo "    build_examples.sh [OPTIONS]"
+    echo ""
+    echo "OPTIONS:"
+    echo "    -t, --target <platform>   Target platform"
+    echo "    -c, --comp   <algorithm>  Compression algorithm used by squashfs"
+    echo "                              (gzip, lzma, lzo, xz, zstd)"
+    echo "    -h, --help                Prints help information"
+
+}
+
+while [[ $# -gt 0 ]]
+do
+key=$1
+
+case $key in
+    -t|--target)
+    PLATFORM="$2"
+    shift # past argument
+    shift # past value
+    ;;
+    -c|--comp)
+    COMPRESSION_ALGORITHM="$2"
+    shift # past argument
+    shift # past value
+    ;;
+    -h|--help)
+    usage
+    exit 0
+    ;;
+    *) # unknown
+    shift
+    ;;
+esac
+done
+
+PLATFORM=${PLATFORM-"host"}
+COMPRESSION_ALGORITHM=${COMPRESSION_ALGORITHM-"gzip"}
+
+echo "PLATFORM              = ${PLATFORM}"
+echo "COMPRESSION_ALGORITHM = ${COMPRESSION_ALGORITHM}"
 
 exe() { echo " + $*" ; $* ; }
 
@@ -37,9 +73,9 @@ assert_is_toplevel_dir() {
 # work correct, the scope must be global
 TMP_DIR=""
 cleanup_tmpdir() {
-	if [[ ! -z ${TMP_DIR} ]] ; then
-		rm -rf $TMP_DIR
-	fi
+  if [[ ! -z ${TMP_DIR} ]] ; then
+    rm -rf $TMP_DIR
+  fi
 }
 
 create_temp_dir() {
@@ -67,12 +103,10 @@ provision_artifact() {
   fi
 }
 
-provision_manifest() {
+provision_root_folder() {
   local EXAMPLE="$1"
   local ROOT_DIR="$2"
-  local TMP_DIR="$3"
 
-  cp "${EXAMPLE}/manifest.yaml" "${TMP_DIR}"
   if [ -d "${EXAMPLE}/root/" ]; then
     cp -r "${EXAMPLE}/root/." "${ROOT_DIR}/"
   fi
@@ -85,35 +119,41 @@ build_example() {
   local NAME="$(basename "${EXAMPLE}")"
   echo "${bold}Building ${NAME}${normal} (target: ${PLATFORM})"
 
+  local MANIFEST="${EXAMPLE}/manifest.yaml"
   local ROOT_DIR="${TMP_DIR}/root"
+  exe rm -rf "${ROOT_DIR}"
   exe mkdir -p "${ROOT_DIR}"
 
-  # Copy manifest and root to tmp
-  provision_manifest "${EXAMPLE}" "${ROOT_DIR}" "${TMP_DIR}"
+  # Copy root folder to tmp
+  provision_root_folder "${EXAMPLE}" "${ROOT_DIR}"
 
   # Cross compile and store artifacts for Rust containers
   if [ -f "${EXAMPLE}/Cargo.toml" ]; then
     provision_artifact "${NAME}" "${ROOT_DIR}"
   fi
 
-  exe cargo run --bin sextant -- pack --dir "${TMP_DIR}" --out "${OUTPUT_DIR}" --key "./examples/keys/north.key"
+  exe cargo run --bin sextant -- pack --manifest "${MANIFEST}" --root "${ROOT_DIR}" --out "${OUTPUT_DIR}" --key "./examples/keys/northstar.key" --comp "${COMPRESSION_ALGORITHM}"
 }
 
 main() {
   assert_is_toplevel_dir
 
   local EXAMPLES=(
+    "./examples/container/capabilities"
     "./examples/container/cpueater"
     "./examples/container/crashing"
     "./examples/container/datarw"
-    "./examples/container/hello"
+    "./examples/container/hello-world"
     "./examples/container/memeater"
     "./examples/container/resource/ferris"
-    "./examples/container/resource/ferris_says_hello"
-    "./examples/container/resource/hello_message"
+    "./examples/container/resource/hello-ferris"
+    "./examples/container/resource/hello-resource"
+    "./examples/container/resource/message-0.0.1"
+    "./examples/container/resource/message-0.0.2"
+    "./examples/container/seccomp"
   )
 
-  local OUTPUT_DIR="./target/north/registry"
+  local OUTPUT_DIR="./target/northstar/repository"
 
   echo "${bold}Creating ${OUTPUT_DIR}${normal}"
   exe mkdir -p "${OUTPUT_DIR}"
